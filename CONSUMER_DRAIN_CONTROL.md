@@ -16,8 +16,8 @@ The standard client behavior can lead to new messages being fetched as buffered 
 
 #### Benefits of this Enhanced Drain Control
 
-1. **Precise Inflow Stoppage**: Guarantees that no new messages are pulled from the broker while the consumer is in "drain mode," even as buffered messages are acknowledged.
+1. **Precise Inflow Stoppage**: Guarantees that no new messages are pulled from the broker while the consumer is in "drain mode", even as buffered messages are acknowledged.
 2. **Complete Processing of Buffered Messages**: Facilitates the full processing of messages already residing in the application's `MessageChannel` and the client's internal `queueCh`.
-3. **Minimized Operational Redeliveries**: By cleanly processing buffered messages before state changes (dynamic reconfiguration, shutdowns), it reduces the chances of messages being NACKed or becoming unacknowledged due to the operation itself, thereby minimizing operationally-induced redeliveries. This supports overall message processing order for a given key.
+3. **Minimized Operational Redeliveries**: By cleanly processing buffered messages before state changes (dynamic reconfiguration, shutdowns), it reduces the chances of messages being NACKed or becoming unacknowledged due to the operation itself, thereby _minimizing operationally-induced redeliveries_. This _supports overall message processing order_ for a given key.
 4. **`Key_Shared` Stickiness Support**: Aims to maintain `Key_Shared` subscription stickiness during the drain period by keeping the underlying connection to the broker alive, even though new message flow is paused. This is particularly important for ensuring keys are not prematurely reassigned during short operational pauses. [Not sure if this is necessary. Will need to test and validate this behavior.]
 5. **Predictable Shutdowns/Updates**: Enables more deterministic behavior during deployments, scaling events, or rule updates in distributed environments.
