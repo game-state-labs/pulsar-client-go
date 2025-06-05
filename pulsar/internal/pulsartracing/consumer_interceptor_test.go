@@ -119,3 +119,11 @@ func (c *mockConsumer) GetLastMessageIDs() ([]pulsar.TopicMessageID, error) {
 	ids := make([]pulsar.TopicMessageID, 0)
 	return ids, nil
 }
+
+func (c *mockConsumer) EnterDrainMode() error {
+	return nil
+}
+
+func (c *mockConsumer) ExitDrainMode() error {
+	return nil
+}

@@ -288,6 +288,20 @@ func (z *zeroQueueConsumer) SeekByTime(time time.Time) error {
 	return errs
 }
 
+func (z *zeroQueueConsumer) EnterDrainMode() error {
+	z.Lock()
+	defer z.Unlock()
+
+	return z.pc.enterInternalDrainMode()
+}
+
+func (z *zeroQueueConsumer) ExitDrainMode() error {
+	z.Lock()
+	defer z.Unlock()
+
+	return z.pc.exitInternalDrainMode()
+}
+
 func (z *zeroQueueConsumer) Name() string {
 	return z.consumerName
 }

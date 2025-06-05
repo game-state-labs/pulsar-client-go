@@ -393,4 +393,13 @@ type Consumer interface {
 
 	// Name returns the name of consumer.
 	Name() string
+
+	// EnterDrainMode stops sending permit flow requests to the broker, preventing
+	// delivery of any new messages while allowing the consumer to process existing
+	// messages in the client buffer.
+	EnterDrainMode() error
+
+	// ExitDrainMode resumes normal message flow by allowing the consumer to send
+	// permit flow requests to the broker for new message delivery.
+	ExitDrainMode() error
 }

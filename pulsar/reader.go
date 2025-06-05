@@ -140,4 +140,13 @@ type Reader interface {
 	// GetLastMessageID get the last message id available for consume.
 	// It only works for single topic reader. It will return an error when the reader is the multi-topic reader.
 	GetLastMessageID() (MessageID, error)
+
+	// EnterDrainMode stops sending permit flow requests to the broker, preventing
+	// delivery of any new messages while allowing the reader to process existing
+	// messages in the client buffer.
+	EnterDrainMode() error
+
+	// ExitDrainMode resumes normal message flow by allowing the reader to send
+	// permit flow requests to the broker for new message delivery.
+	ExitDrainMode() error
 }

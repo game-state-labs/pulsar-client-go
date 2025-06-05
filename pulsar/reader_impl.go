@@ -223,6 +223,20 @@ func (r *reader) SeekByTime(time time.Time) error {
 	return r.c.SeekByTime(time)
 }
 
+func (r *reader) EnterDrainMode() error {
+	r.Lock()
+	defer r.Unlock()
+
+	return r.c.EnterDrainMode()
+}
+
+func (r *reader) ExitDrainMode() error {
+	r.Lock()
+	defer r.Unlock()
+
+	return r.c.ExitDrainMode()
+}
+
 func (r *reader) GetLastMessageID() (MessageID, error) {
 	if len(r.c.consumers) > 1 {
 		return nil, fmt.Errorf("GetLastMessageID is not supported for multi-topics reader")

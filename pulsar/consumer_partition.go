@@ -201,6 +201,10 @@ type partitionConsumer struct {
 	hasSoughtByTime atomic.Bool
 	ctx             context.Context
 	cancelFunc      context.CancelFunc
+
+	// When true, the consumer is in "drain mode" and will not send new permit flow requests to the broker.
+	// This allows processing of already-delivered messages without receiving new ones.
+	isDrainingNoNewPermits atomic.Bool
 }
 
 // pauseDispatchMessage used to discard the message in the dispatcher goroutine.
@@ -262,6 +266,12 @@ func (p *availablePermits) flowIfNeed() {
 
 	current := p.get()
 	if current >= flowThreshold {
+		// If in drain mode, don't request more permits to broker
+		if p.pc.isDrainingNoNewPermits.Load() {
+			p.pc.log.Debug("In drain mode - not requesting more permits from broker")
+			return
+		}
+
 		availablePermits := current
 		requestedPermits := current
 		// check if permits changed

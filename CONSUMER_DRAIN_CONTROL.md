@@ -32,7 +32,7 @@ This fork introduces an explicit **"drain mode"** to address these scenarios by 
 **How the Draining Mechanism Relates and Its Benefits**:
 
 - **Preventing Operational-Induced Redeliveries**: The primary benefit of the drain mode is to **minimize message redeliveries that are a direct consequence of the operational procedure itself** (e.g., dynamic configuration updates, graceful shutdowns, etc.). It does not solve all redelivery scenarios. During such operations, _without controlled draining_ messages residing in client buffers (both the application's `MessageChannel` and the client's internal `queueCh`) might not be fully processed and ACKed, when a consumer is stopped or its processing logic changes mid-flight. These become unacknowledged from the broker's perspective and will be redelivered. _With this fork's `EnterDrainMode()`_:
-  - The application explicitly command the client to stop sending new message permits from the broker, even if buffered messages are being acknowledged.
+  - The application explicitly command the client to stop requesting new message permits from the broker, even if buffered messages are being acknowledged.
   - This allows the application to safely process and acknowledge every message that has already been fetched by the client and is residing in its buffers.
   - This significantly reduces the pool of messages that would otherwise become unacknowledged (and thus redelivered) due to the shutdown or rule change itself.
 - **Supporting Overall Orderliness for Keyed Messages During Operations**:
@@ -48,3 +48,102 @@ Beyond addressing redelivery concerns, drain mode provides some operational adva
 - **Horizontally Scaled Environments**: Supports more predictable behavior and cleaner state transitions during deployments, scaling events, or rule updates, particularly valuable in containerized or auto-scaled deployments.
 
 The need for **idempotent message processing logic in the application remains absolutely crucial** for robustly handling all types of redelivery scenarios that can occur in a distributed messaging system. This "drain mode" assists in making planned operational procedures smoother and less prone to causing unnecessary redeliveries.
+
+## API Usage
+
+The drain mode feature is available on both the `Consumer` and `Reader` interfaces through two methods:
+
+```go
+// Consumer interface
+func (c *consumer) EnterDrainMode() error
+func (c *consumer) ExitDrainMode() error
+
+// Reader interface (which wraps a Consumer)
+func (r *reader) EnterDrainMode() error
+func (r *reader) ExitDrainMode() error
+```
+
+### Example: Rule Change with Drain Mode
+
+```go
+// When processing logic/rules need to be updated:
+func updateConsumerRules(consumer pulsar.Consumer) error {
+    // 1. Enter drain mode to stop receiving new messages from broker
+    if err := consumer.EnterDrainMode(); err != nil {
+        return fmt.Errorf("failed to enter drain mode: %w", err)
+    }
+
+    // 2. Process all messages already in client buffers with current rules
+    for {
+        ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+        msg, err := consumer.Receive(ctx)
+        cancel()
+
+        if err != nil {
+            // No more messages in buffer
+            break
+        }
+
+        // Process with current rules
+        processMessageWithCurrentRules(msg)
+        consumer.Ack(msg)
+    }
+
+    // 3. Update processing rules
+    updateRules()
+
+    // 4. Resume normal message flow with new rules
+    if err := consumer.ExitDrainMode(); err != nil {
+        return fmt.Errorf("failed to exit drain mode: %w", err)
+    }
+
+    return nil
+}
+```
+
+### Example: Graceful Shutdown with Drain Mode
+
+```go
+// For graceful application shutdown:
+func performGracefulShutdown(consumer pulsar.Consumer, shutdownTimeout time.Duration) {
+    // 1. Enter drain mode to stop receiving new messages from broker
+    if err := consumer.EnterDrainMode(); err != nil {
+        log.Printf("Warning: Failed to enter drain mode: %v", err)
+    }
+
+    // 2. Set a deadline for processing remaining messages
+    ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+    defer cancel()
+
+    // 3. Process remaining buffered messages until deadline
+    for {
+        receiveCtx, receiveCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+        msg, err := consumer.Receive(receiveCtx)
+        receiveCancel()
+
+        if err != nil {
+            // Either no more messages or shutdown deadline reached
+            break
+        }
+
+        // Process and acknowledge message
+        processMessage(msg)
+        consumer.Ack(msg)
+    }
+
+    // 4. Close the consumer
+    consumer.Close()
+
+    log.Println("Consumer shutdown gracefully")
+}
+```
+
+## Metrics
+
+To help monitor and track the usage of drain mode, the following metrics have been added:
+
+- `pulsar_client_consumers_in_drain_mode`: A gauge that tracks the number of consumers currently in drain mode.
+- `pulsar_client_drain_mode_entered`: A counter that increments every time a consumer enters drain mode.
+- `pulsar_client_drain_mode_exited`: A counter that increments every time a consumer exits drain mode.
+
+These metrics follow the same labeling patterns as other Pulsar client metrics, with labels added based on the configured `MetricsCardinality` (tenant, namespace, topic).

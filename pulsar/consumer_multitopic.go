@@ -97,6 +97,30 @@ func (c *multiTopicConsumer) Unsubscribe() error {
 	return errs
 }
 
+func (c *multiTopicConsumer) EnterDrainMode() error {
+	var errs error
+	for t, consumer := range c.consumers {
+		if err := consumer.EnterDrainMode(); err != nil {
+			msg := fmt.Sprintf("unable to enter drain mode for topic=%s subscription=%s",
+				t, c.Subscription())
+			errs = pkgerrors.Wrap(err, msg)
+		}
+	}
+	return errs
+}
+
+func (c *multiTopicConsumer) ExitDrainMode() error {
+	var errs error
+	for t, consumer := range c.consumers {
+		if err := consumer.ExitDrainMode(); err != nil {
+			msg := fmt.Sprintf("unable to exit drain mode for topic=%s subscription=%s",
+				t, c.Subscription())
+			errs = pkgerrors.Wrap(err, msg)
+		}
+	}
+	return errs
+}
+
 func (c *multiTopicConsumer) UnsubscribeForce() error {
 	var errs error
 	for t, consumer := range c.consumers {
