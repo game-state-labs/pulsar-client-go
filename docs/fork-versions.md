@@ -3,3 +3,4 @@ This fork is based on [apache/pulsar-client-go](https://github.com/apache/pulsar
 ### Versions
 
 - `v0.15.1-gsl.1`: Based on apache/pulsar-client-go v0.15.1 with drain mode functionality
+- `v0.15.1-gsl.2`: Optimization in drain mode implementation
