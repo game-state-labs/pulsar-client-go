@@ -255,6 +255,11 @@ func (p *availablePermits) get() int32 {
 }
 
 func (p *availablePermits) flowIfNeed() {
+	// If in drain mode, don't request more permits to broker
+	if p.pc.isDrainingNoNewPermits.Load() {
+		p.pc.log.Debug("In drain mode - not requesting more permits from broker")
+		return
+	}
 	// TODO implement a better flow controller
 	// send more permits if needed
 	var flowThreshold int32
@@ -266,11 +271,6 @@ func (p *availablePermits) flowIfNeed() {
 
 	current := p.get()
 	if current >= flowThreshold {
-		// If in drain mode, don't request more permits to broker
-		if p.pc.isDrainingNoNewPermits.Load() {
-			p.pc.log.Debug("In drain mode - not requesting more permits from broker")
-			return
-		}
 
 		availablePermits := current
 		requestedPermits := current
