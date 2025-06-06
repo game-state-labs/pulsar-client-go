@@ -53,6 +53,10 @@ type Metrics struct {
 	readersOpened              *prometheus.CounterVec
 	readersClosed              *prometheus.CounterVec
 
+	consumersInDrainMode *prometheus.GaugeVec
+	drainModeEntered     *prometheus.CounterVec
+	drainModeExited      *prometheus.CounterVec
+
 	// Metrics that are not labeled with specificity are immediately available
 	ConnectionsOpened                     prometheus.Counter
 	ConnectionsClosed                     prometheus.Counter
@@ -81,6 +85,10 @@ type LeveledMetrics struct {
 	NacksCounter       prometheus.Counter
 	DlqCounter         prometheus.Counter
 	ProcessingTime     prometheus.Observer
+
+	ConsumersInDrainMode prometheus.Gauge
+	DrainModeEntered     prometheus.Counter
+	DrainModeExited      prometheus.Counter
 
 	ProducersOpened            prometheus.Counter
 	ProducersClosed            prometheus.Counter
@@ -132,6 +140,25 @@ func NewMetricsProvider(metricsCardinality int, userDefinedLabels map[string]str
 		bytesPublished: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        "pulsar_client_bytes_published",
 			Help:        "Counter of messages published by the client",
+			ConstLabels: constLabels,
+		}, metricsLevelLabels),
+
+		// Drain mode metrics
+		consumersInDrainMode: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "pulsar_client_consumers_in_drain_mode",
+			Help:        "Number of consumers currently in drain mode",
+			ConstLabels: constLabels,
+		}, metricsLevelLabels),
+
+		drainModeEntered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "pulsar_client_drain_mode_entered",
+			Help:        "Counter of drain mode entered events",
+			ConstLabels: constLabels,
+		}, metricsLevelLabels),
+
+		drainModeExited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "pulsar_client_drain_mode_exited",
+			Help:        "Counter of drain mode exited events",
 			ConstLabels: constLabels,
 		}, metricsLevelLabels),
 
@@ -353,6 +380,28 @@ func NewMetricsProvider(metricsCardinality int, userDefinedLabels map[string]str
 	if err != nil {
 		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
 			metrics.bytesPending = are.ExistingCollector.(*prometheus.GaugeVec)
+		}
+	}
+
+	// Register drain mode metrics
+	err = registerer.Register(metrics.consumersInDrainMode)
+	if err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			metrics.consumersInDrainMode = are.ExistingCollector.(*prometheus.GaugeVec)
+		}
+	}
+
+	err = registerer.Register(metrics.drainModeEntered)
+	if err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			metrics.drainModeEntered = are.ExistingCollector.(*prometheus.CounterVec)
+		}
+	}
+
+	err = registerer.Register(metrics.drainModeExited)
+	if err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			metrics.drainModeExited = are.ExistingCollector.(*prometheus.CounterVec)
 		}
 	}
 	err = registerer.Register(metrics.publishErrors)
@@ -585,6 +634,9 @@ func (mp *Metrics) GetLeveledMetrics(t string) *LeveledMetrics {
 		ConsumersReconnectFailure:  mp.consumersReconnectFailure.With(labels),
 		ConsumersReconnectMaxRetry: mp.consumersReconnectMaxRetry.With(labels),
 		ConsumersPartitions:        mp.consumersPartitions.With(labels),
+		ConsumersInDrainMode:       mp.consumersInDrainMode.With(labels),
+		DrainModeEntered:           mp.drainModeEntered.With(labels),
+		DrainModeExited:            mp.drainModeExited.With(labels),
 		ReadersOpened:              mp.readersOpened.With(labels),
 		ReadersClosed:              mp.readersClosed.With(labels),
 	}
