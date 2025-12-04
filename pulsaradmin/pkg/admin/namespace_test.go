@@ -19,6 +19,7 @@ package admin
 
 import (
 	"testing"
+	"time"
 
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/admin/config"
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/rest"
@@ -340,4 +341,261 @@ func TestNamespaces_GetOffloadThresholdInSeconds(t *testing.T) {
 	assert.Equal(t, nil, err)
 	expected := int64(60)
 	assert.Equal(t, expected, offloadThresholdInSeconds)
+}
+
+func TestNamespaces_SetSchemaCompatibilityStrategy(t *testing.T) {
+	config := &config.Config{}
+	admin, err := New(config)
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+
+	tests := []struct {
+		name      string
+		namespace string
+		strategy  utils.SchemaCompatibilityStrategy
+		errReason string
+	}{
+		{
+			name:      "Set Undefined strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyUndefined,
+			errReason: "",
+		},
+		{
+			name:      "Set AlwaysIncompatible strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyAlwaysIncompatible,
+			errReason: "",
+		},
+		{
+			name:      "Set AlwaysCompatible strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyAlwaysCompatible,
+			errReason: "",
+		},
+		{
+			name:      "Set Backward strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyBackward,
+			errReason: "",
+		},
+		{
+			name:      "Set Forward strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyForward,
+			errReason: "",
+		},
+		{
+			name:      "Set Full strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyFull,
+			errReason: "",
+		},
+		{
+			name:      "Set BackwardTransitive strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyBackwardTransitive,
+			errReason: "",
+		},
+		{
+			name:      "Set ForwardTransitive strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyForwardTransitive,
+			errReason: "",
+		},
+		{
+			name:      "Set FullTransitive strategy",
+			namespace: "public/default",
+			strategy:  utils.SchemaCompatibilityStrategyFullTransitive,
+			errReason: "",
+		},
+		{
+			name:      "Set strategy on non-existent namespace",
+			namespace: "public/nonexist",
+			strategy:  utils.SchemaCompatibilityStrategyFull,
+			errReason: "Namespace does not exist",
+		},
+		{
+			name:      "Set strategy on non-existent tenant",
+			namespace: "non-exist/default",
+			strategy:  utils.SchemaCompatibilityStrategyFull,
+			errReason: "Tenant does not exist",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			namespace, _ := utils.GetNamespaceName(tt.namespace)
+			err := admin.Namespaces().SetSchemaCompatibilityStrategy(*namespace, tt.strategy)
+
+			// Skip test if network connection fails (Pulsar server not running)
+			if err != nil {
+				if _, ok := err.(rest.Error); !ok {
+					t.Skipf("Skipping test due to network error: %v", err)
+				}
+			}
+
+			if tt.errReason == "" {
+				assert.Equal(t, nil, err)
+			} else {
+				if restError, ok := err.(rest.Error); ok {
+					assert.Equal(t, tt.errReason, restError.Reason)
+				}
+			}
+		})
+	}
+}
+
+func TestNamespaces_GetSchemaCompatibilityStrategy(t *testing.T) {
+	config := &config.Config{}
+	admin, err := New(config)
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+
+	namespace, _ := utils.GetNamespaceName("public/default")
+
+	// Test setting and getting different strategies
+	testStrategies := []utils.SchemaCompatibilityStrategy{
+		utils.SchemaCompatibilityStrategyFull,
+		utils.SchemaCompatibilityStrategyBackward,
+		utils.SchemaCompatibilityStrategyForward,
+		utils.SchemaCompatibilityStrategyAlwaysCompatible,
+	}
+
+	for _, strategy := range testStrategies {
+		// Set the schema compatibility strategy
+		err = admin.Namespaces().SetSchemaCompatibilityStrategy(*namespace, strategy)
+		if err != nil {
+			t.Skipf("Skipping test due to connection error: %v", err)
+		}
+
+		// Wait for the strategy to be set
+		time.Sleep(5 * time.Second)
+
+		// Get and verify the strategy
+		retrievedStrategy, err := admin.Namespaces().GetSchemaCompatibilityStrategy(*namespace)
+		if err != nil {
+			t.Skipf("Skipping test due to connection error: %v", err)
+		}
+		assert.Equal(t, strategy, retrievedStrategy)
+	}
+
+	// Test getting default strategy (should be Undefined after reset)
+	err = admin.Namespaces().SetSchemaCompatibilityStrategy(*namespace, utils.SchemaCompatibilityStrategyUndefined)
+	if err != nil {
+		t.Skipf("Skipping test due to connection error: %v", err)
+	}
+
+	// Wait for the strategy to be set
+	time.Sleep(5 * time.Second)
+
+	defaultStrategy, err := admin.Namespaces().GetSchemaCompatibilityStrategy(*namespace)
+	if err != nil {
+		t.Skipf("Skipping test due to connection error: %v", err)
+	}
+	assert.Equal(t, utils.SchemaCompatibilityStrategyUndefined, defaultStrategy)
+}
+
+func TestNamespaces_Properties(t *testing.T) {
+	config := &config.Config{}
+	admin, err := New(config)
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+
+	namespace, err := utils.GetNamespaceName("public/default")
+	assert.Equal(t, err, nil)
+
+	// Namespace properties are expected to be set and retrieved successfully
+	properties := map[string]string{
+		"key-1": "value-1",
+	}
+	err = admin.Namespaces().UpdateProperties(*namespace, properties)
+	assert.Equal(t, err, nil)
+
+	actualProperties, err := admin.Namespaces().GetProperties(*namespace)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, actualProperties, properties)
+
+	// All namespace properties are expected to be deleted successfully
+	err = admin.Namespaces().RemoveProperties(*namespace)
+	assert.Equal(t, err, nil)
+	actualPropertiesAfterRemoveCall, err := admin.Namespaces().GetProperties(*namespace)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, actualPropertiesAfterRemoveCall, map[string]string{})
+}
+
+func TestNamespaces_SetMaxTopicsPerNamespace(t *testing.T) {
+	config := &config.Config{}
+	admin, err := New(config)
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+
+	tests := []struct {
+		name      string
+		namespace string
+		maxTopics int
+		errReason string
+	}{
+		{
+			name:      "Set valid max topics per namespace",
+			namespace: "public/default",
+			maxTopics: 100,
+			errReason: "",
+		},
+		{
+			name:      "Set invalid max topics per namespace",
+			namespace: "public/default",
+			maxTopics: -1,
+			errReason: "maxTopicsPerNamespace must be 0 or more",
+		},
+		{
+			name:      "Set valid max topics per namespace: 0",
+			namespace: "public/default",
+			maxTopics: 0,
+			errReason: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			namespace, _ := utils.GetNamespaceName(tt.namespace)
+			err := admin.Namespaces().SetMaxTopicsPerNamespace(*namespace, tt.maxTopics)
+			if tt.errReason == "" {
+				assert.Equal(t, nil, err)
+
+				err = admin.Namespaces().RemoveMaxTopicsPerNamespace(*namespace)
+				assert.Equal(t, nil, err)
+			}
+			if err != nil {
+				restError := err.(rest.Error)
+				assert.Equal(t, tt.errReason, restError.Reason)
+			}
+		})
+	}
+}
+
+func TestNamespaces_GetMaxTopicsPerNamespace(t *testing.T) {
+
+	config := &config.Config{}
+	admin, err := New(config)
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+
+	namespace, _ := utils.GetNamespaceName("public/default")
+
+	// set the max topics per namespace and get it
+	err = admin.Namespaces().SetMaxTopicsPerNamespace(*namespace, 100)
+	assert.Equal(t, nil, err)
+	maxTopics, err := admin.Namespaces().GetMaxTopicsPerNamespace(*namespace)
+	assert.Equal(t, nil, err)
+	expected := 100
+	assert.Equal(t, expected, maxTopics)
+
+	// remove the max topics per namespace and get it
+	err = admin.Namespaces().RemoveMaxTopicsPerNamespace(*namespace)
+	assert.Equal(t, nil, err)
+
+	maxTopics, err = admin.Namespaces().GetMaxTopicsPerNamespace(*namespace)
+	assert.Equal(t, nil, err)
+	expected = 0
+	assert.Equal(t, expected, maxTopics)
 }

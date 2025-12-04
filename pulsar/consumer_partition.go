@@ -123,9 +123,10 @@ type partitionConsumerOpts struct {
 	expireTimeOfIncompleteChunk time.Duration
 	autoAckIncompleteChunk      bool
 	// in failover mode, this callback will be called when consumer change
-	consumerEventListener ConsumerEventListener
-	enableBatchIndexAck   bool
-	ackGroupingOptions    *AckGroupingOptions
+	consumerEventListener   ConsumerEventListener
+	enableBatchIndexAck     bool
+	ackGroupingOptions      *AckGroupingOptions
+	enableZeroQueueConsumer bool
 }
 
 type ConsumerEventListener interface {
@@ -328,22 +329,22 @@ func (s *schemaInfoCache) Get(schemaVersion []byte) (schema Schema, err error) {
 		return schema, nil
 	}
 
-	pbSchema, err := s.client.lookupService.GetSchema(s.topic, schemaVersion)
+	//	cache missed, try to use lookupService to find schema info
+	lookupSchema, err := s.client.lookupService.GetSchema(s.topic, schemaVersion)
+	if err != nil {
+		return nil, err
+	}
+	schema, err = NewSchema(
+		//	lookupSchema.SchemaType is internal package SchemaType type,
+		//	we need to cast it to pulsar.SchemaType as soon as we use it in current pulsar package
+		SchemaType(lookupSchema.SchemaType),
+		lookupSchema.Data,
+		lookupSchema.Properties,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	if pbSchema == nil {
-		err = fmt.Errorf("schema not found for topic: [ %v ], schema version : [ %v ]", s.topic, schemaVersion)
-		return nil, err
-	}
-
-	var properties = internal.ConvertToStringMap(pbSchema.Properties)
-
-	schema, err = NewSchema(SchemaType(*pbSchema.Type), pbSchema.SchemaData, properties)
-	if err != nil {
-		return nil, err
-	}
 	s.add(key, schema)
 	return schema, nil
 }
@@ -770,6 +771,7 @@ func (pc *partitionConsumer) AckIDList(msgIDs []MessageID) error {
 				position := newPosition(msgID)
 				if convertedMsgID.ack() {
 					pendingAcks[position] = nil
+					pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-convertedMsgID.receivedTime.UnixNano()) / 1.0e9)
 				} else if pc.options.enableBatchIndexAck {
 					pendingAcks[position] = convertedMsgID.tracker.getAckBitSet()
 				}
@@ -794,6 +796,8 @@ func (pc *partitionConsumer) AckIDList(msgIDs []MessageID) error {
 		pc.log.WithField("state", state).Error("Failed to ack by closing or closed consumer")
 		return toAckError(map[error][]MessageID{errors.New("consumer state is closed"): validMsgIDs})
 	}
+
+	pc.metrics.AcksCounter.Add(float64(len(validMsgIDs)))
 
 	req := &ackListRequest{
 		errCh:  make(chan error),
@@ -1613,6 +1617,26 @@ func (pc *partitionConsumer) dispatcher() {
 			if !pc.isSeeking.Load() {
 				if pc.dlq.shouldSendToDlq(&nextMessage) {
 					// pass the message to the DLQ router
+					// we need to create a new ConsumerMessage and add dlq related metadata properties
+					properties := make(map[string]string)
+					properties[SysPropertyRealTopic] = messages[0].Topic()
+					properties[SysPropertyOriginMessageID] = messages[0].msgID.String()
+					properties[PropertyOriginMessageID] = messages[0].msgID.String()
+					for key, value := range messages[0].properties {
+						properties[key] = value
+					}
+					nextMessage = ConsumerMessage{
+						Consumer: pc.parentConsumer,
+						// Copy msgID so that dlq/rlq router can ack this msg after successfully sent to new topic
+						Message: &message{
+							payLoad:     messages[0].Payload(),
+							key:         messages[0].Key(),
+							orderingKey: messages[0].OrderingKey(),
+							properties:  properties,
+							eventTime:   messages[0].EventTime(),
+							msgID:       messages[0].msgID,
+						},
+					}
 					pc.metrics.DlqCounter.Inc()
 					messageCh = pc.dlq.Chan()
 				} else {
@@ -1652,7 +1676,7 @@ func (pc *partitionConsumer) dispatcher() {
 
 			pc.log.Debugf("dispatcher requesting initial permits=%d", initialPermits)
 			// send initial permits
-			if err := pc.internalFlow(initialPermits); err != nil {
+			if err := pc.internalFlow(initialPermits); err != nil && !pc.options.enableZeroQueueConsumer {
 				pc.log.WithError(err).Error("unable to send initial permits to broker")
 			}
 
@@ -1909,6 +1933,10 @@ func (pc *partitionConsumer) reconnectToBroker(connectionClosed *connectionClose
 			// Successfully reconnected
 			pc.log.Info("Reconnected consumer to broker")
 			bo.Reset()
+			if pc.options.enableZeroQueueConsumer {
+				pc.log.Info("zeroQueueConsumer reconnect, reset availablePermits")
+				pc.availablePermits.inc()
+			}
 			return struct{}{}, nil
 		}
 		pc.log.WithError(err).Error("Failed to create consumer at reconnect")
@@ -1941,7 +1969,11 @@ func (pc *partitionConsumer) reconnectToBroker(connectionClosed *connectionClose
 
 func (pc *partitionConsumer) lookupTopic(brokerServiceURL string) (*internal.LookupResult, error) {
 	if len(brokerServiceURL) == 0 {
-		lr, err := pc.client.rpcClient.LookupService(pc.redirectedClusterURI).Lookup(pc.topic)
+		lookupService, err := pc.client.rpcClient.LookupService(pc.redirectedClusterURI)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get lookup service: %w", err)
+		}
+		lr, err := lookupService.Lookup(pc.topic)
 		if err != nil {
 			pc.log.WithError(err).Warn("Failed to lookup topic")
 			return nil, err
@@ -2225,6 +2257,8 @@ func (pc *partitionConsumer) initializeCompressionProvider(
 		return compression.NewLz4Provider(), nil
 	case pb.CompressionType_ZSTD:
 		return compression.NewZStdProvider(compression.Default), nil
+	case pb.CompressionType_SNAPPY:
+		return compression.NewSnappyProvider(), nil
 	}
 
 	return nil, fmt.Errorf("unsupported compression type: %v", compressionType)

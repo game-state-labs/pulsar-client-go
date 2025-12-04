@@ -15,36 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package internal
+package compression
 
 import (
-	"runtime/debug"
-
-	"golang.org/x/mod/semver"
+	"github.com/klauspost/compress/snappy"
 )
 
-const (
-	pulsarClientGoModulePath = "github.com/apache/pulsar-client-go"
-)
+type snappyProvider struct {
+}
 
-var (
-	Version             string
-	ClientVersionString string
-)
+// NewSnappyProvider returns a Provider interface
+func NewSnappyProvider() Provider {
+	return &snappyProvider{}
+}
 
-// init Initializes the module version information by reading
-// the built in golang build info.  If the application was not built
-// using go modules then the version string will not be available.
-func init() {
-	if buildInfo, ok := debug.ReadBuildInfo(); ok {
-		for _, dep := range buildInfo.Deps {
-			if dep.Path == pulsarClientGoModulePath {
-				Version = semver.Canonical(dep.Version)
-				ClientVersionString = "Pulsar-Go-" + Version
-				return
-			}
-		}
-	}
-	Version = "unknown"
-	ClientVersionString = "Pulsar-Go-version-unknown"
+func (p *snappyProvider) CompressMaxSize(srcSize int) int {
+	return snappy.MaxEncodedLen(srcSize)
+}
+
+func (p *snappyProvider) Compress(dst, src []byte) []byte {
+	return snappy.Encode(dst, src)
+}
+
+func (p *snappyProvider) Decompress(dst, src []byte, _ int) ([]byte, error) {
+	return snappy.Decode(dst, src)
+}
+
+func (p *snappyProvider) Close() error {
+	return nil
+}
+
+func (p *snappyProvider) Clone() Provider {
+	return &snappyProvider{}
 }

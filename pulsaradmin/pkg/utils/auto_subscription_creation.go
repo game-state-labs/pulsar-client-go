@@ -15,36 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package internal
+package utils
 
-import (
-	"runtime/debug"
+type AutoSubscriptionCreationOverride struct {
+	AllowAutoSubscriptionCreation bool `json:"allowAutoSubscriptionCreation"`
+}
 
-	"golang.org/x/mod/semver"
-)
-
-const (
-	pulsarClientGoModulePath = "github.com/apache/pulsar-client-go"
-)
-
-var (
-	Version             string
-	ClientVersionString string
-)
-
-// init Initializes the module version information by reading
-// the built in golang build info.  If the application was not built
-// using go modules then the version string will not be available.
-func init() {
-	if buildInfo, ok := debug.ReadBuildInfo(); ok {
-		for _, dep := range buildInfo.Deps {
-			if dep.Path == pulsarClientGoModulePath {
-				Version = semver.Canonical(dep.Version)
-				ClientVersionString = "Pulsar-Go-" + Version
-				return
-			}
-		}
+func NewAutoSubscriptionCreationOverride() *AutoSubscriptionCreationOverride {
+	return &AutoSubscriptionCreationOverride{
+		AllowAutoSubscriptionCreation: false,
 	}
-	Version = "unknown"
-	ClientVersionString = "Pulsar-Go-version-unknown"
 }

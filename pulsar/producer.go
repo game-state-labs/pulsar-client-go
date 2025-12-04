@@ -40,6 +40,7 @@ const (
 	LZ4
 	ZLib
 	ZSTD
+	SNAPPY
 )
 
 type CompressionLevel int
@@ -120,6 +121,7 @@ type ProducerOptions struct {
 	//  - LZ4
 	//  - ZLIB
 	//  - ZSTD
+	//	- SNAPPY
 	//
 	// Note: ZSTD is supported since Pulsar 2.3. Consumers will need to be at least at that
 	// release in order to be able to receive messages compressed with ZSTD.
@@ -233,6 +235,15 @@ type Producer interface {
 	// This call is blocked when the `maxPendingMessages` becomes full (default: 1000)
 	// The callback will report back the message being published and
 	// the eventual error in publishing
+	// The context passed in the call is only used for the duration of the SendAsync call itself
+	// (i.e., to control blocking when the queue is full), and not for the entire message lifetime.
+	// Once SendAsync returns, the message lifetime is controlled by the SendTimeout configuration.
+	// Example:
+	// producer.SendAsync(ctx, &pulsar.ProducerMessage{
+	//     Payload: myPayload,
+	// }, func(msgID pulsar.MessageID, message *pulsar.ProducerMessage, err error) {
+	//     // handle publish result
+	// })
 	SendAsync(context.Context, *ProducerMessage, func(MessageID, *ProducerMessage, error))
 
 	// LastSequenceID get the last sequence id that was published by this producer.
