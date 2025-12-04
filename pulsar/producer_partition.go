@@ -47,6 +47,7 @@ type producerState int32
 const (
 	// producer states
 	producerInit = iota
+	producerConnecting
 	producerReady
 	producerClosing
 	producerClosed
@@ -69,7 +70,7 @@ var (
 	ErrProducerBlockedQuotaExceeded = newError(ProducerBlockedQuotaExceededException, "producer blocked")
 	ErrProducerFenced               = newError(ProducerFenced, "producer fenced")
 
-	buffersPool     sync.Pool
+	buffersPool     internal.BuffersPool
 	sendRequestPool *sync.Pool
 )
 
@@ -86,6 +87,7 @@ func init() {
 			return &sendRequest{}
 		},
 	}
+	buffersPool = internal.NewBufferPool()
 }
 
 type partitionProducer struct {
@@ -96,7 +98,7 @@ type partitionProducer struct {
 	topic  string
 	log    log.Logger
 
-	conn         uAtomic.Value
+	conn         atomic.Pointer[internal.Connection]
 	cnxKeySuffix int32
 
 	options                  *ProducerOptions
@@ -217,6 +219,7 @@ func newPartitionProducer(client *client, topic string, options *ProducerOptions
 	} else {
 		p.userProvidedProducerName = false
 	}
+	p.setProducerState(producerConnecting)
 	err := p.grabCnx("")
 	if err != nil {
 		p.batchFlushTicker.Stop()
@@ -243,7 +246,11 @@ func newPartitionProducer(client *client, topic string, options *ProducerOptions
 
 func (p *partitionProducer) lookupTopic(brokerServiceURL string) (*internal.LookupResult, error) {
 	if len(brokerServiceURL) == 0 {
-		lr, err := p.client.rpcClient.LookupService(p.redirectedClusterURI).Lookup(p.topic)
+		lookupService, err := p.client.rpcClient.LookupService(p.redirectedClusterURI)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get lookup service: %w", err)
+		}
+		lr, err := lookupService.Lookup(p.topic)
 		if err != nil {
 			p.log.WithError(err).Warn("Failed to lookup topic")
 			return nil, err
@@ -252,11 +259,18 @@ func (p *partitionProducer) lookupTopic(brokerServiceURL string) (*internal.Look
 		p.log.Debug("Lookup result: ", lr)
 		return lr, err
 	}
-	return p.client.rpcClient.LookupService(p.redirectedClusterURI).
-		GetBrokerAddress(brokerServiceURL, p._getConn().IsProxied())
+	lookupService, err := p.client.rpcClient.LookupService(p.redirectedClusterURI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get lookup service: %w", err)
+	}
+	return lookupService.GetBrokerAddress(brokerServiceURL, p._getConn().IsProxied())
 }
 
 func (p *partitionProducer) grabCnx(assignedBrokerURL string) error {
+	if !p.casProducerState(producerReady, producerConnecting) && p.isClosingOrClosed() {
+		// closing or closed
+		return ErrProducerClosed
+	}
 	lr, err := p.lookupTopic(assignedBrokerURL)
 	if err != nil {
 		return err
@@ -363,7 +377,8 @@ func (p *partitionProducer) grabCnx(assignedBrokerURL string) error {
 		p.batchBuilder, err = provider(p.options.BatchingMaxMessages, p.options.BatchingMaxSize,
 			maxMessageSize, p.producerName, p.producerID, pb.CompressionType(p.options.CompressionType),
 			compression.Level(p.options.CompressionLevel),
-			p,
+			buffersPool,
+			p.client.metrics,
 			p.log,
 			p.encryptor)
 		if err != nil {
@@ -376,30 +391,20 @@ func (p *partitionProducer) grabCnx(assignedBrokerURL string) error {
 		"epoch": atomic.LoadUint64(&p.epoch),
 	}).Info("Connected producer")
 
-	pendingItems := p.pendingQueue.ReadableSlice()
-	viewSize := len(pendingItems)
-	if viewSize > 0 {
-		p.log.Infof("Resending %d pending batches", viewSize)
-		lastViewItem := pendingItems[viewSize-1].(*pendingItem)
+	p.pendingQueue.Lock()
+	defer p.pendingQueue.Unlock()
+	p.pendingQueue.IterateUnsafe(func(item any) {
+		pi := item.(*pendingItem)
+		// when resending pending batches, we update the sendAt timestamp to record the metric.
+		pi.Lock()
+		pi.sentAt = time.Now()
+		pi.Unlock()
+		pi.buffer.Retain() // Retain for writing to the connection
+		p._getConn().WriteData(pi.ctx, pi.buffer)
+	})
 
-		// iterate at most pending items
-		for i := 0; i < viewSize; i++ {
-			item := p.pendingQueue.Poll()
-			if item == nil {
-				continue
-			}
-			pi := item.(*pendingItem)
-			// when resending pending batches, we update the sendAt timestamp to record the metric.
-			pi.Lock()
-			pi.sentAt = time.Now()
-			pi.Unlock()
-			p.pendingQueue.Put(pi)
-			p._getConn().WriteData(pi.ctx, pi.buffer)
-
-			if pi == lastViewItem {
-				break
-			}
-		}
+	if !p.casProducerState(producerConnecting, producerReady) && p.isClosingOrClosed() {
+		return ErrProducerClosed
 	}
 	return nil
 }
@@ -410,14 +415,6 @@ type connectionClosed struct {
 
 func (cc *connectionClosed) HasURL() bool {
 	return len(cc.assignedBrokerURL) > 0
-}
-
-func (p *partitionProducer) GetBuffer() internal.Buffer {
-	b, ok := buffersPool.Get().(internal.Buffer)
-	if ok {
-		b.Clear()
-	}
-	return b
 }
 
 func (p *partitionProducer) ConnectionClosed(closeProducer *pb.CommandCloseProducer) {
@@ -493,9 +490,9 @@ func (p *partitionProducer) reconnectToBroker(connectionClosed *connectionClosed
 			return struct{}{}, nil
 		}
 
-		if p.getProducerState() != producerReady {
+		if p.isClosingOrClosed() {
 			// Producer is already closing
-			p.log.Info("producer state not ready, exit reconnect")
+			p.log.Info("producer state is in closing or closed, exit reconnect")
 			return struct{}{}, nil
 		}
 
@@ -559,6 +556,18 @@ func (p *partitionProducer) reconnectToBroker(connectionClosed *connectionClosed
 }
 
 func (p *partitionProducer) runEventsLoop() {
+	go func() {
+		for {
+			select {
+			case connectionClosed := <-p.connectClosedCh:
+				p.log.Info("runEventsLoop will reconnect in producer")
+				p.reconnectToBroker(connectionClosed)
+			case <-p.ctx.Done():
+				p.log.Info("Producer is shutting down. Close the reconnect event loop")
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case data, ok := <-p.dataChan:
@@ -579,9 +588,6 @@ func (p *partitionProducer) runEventsLoop() {
 				p.internalClose(v)
 				return
 			}
-		case connectionClosed := <-p.connectClosedCh:
-			p.log.Info("runEventsLoop will reconnect in producer")
-			p.reconnectToBroker(connectionClosed)
 		case <-p.batchFlushTicker.C:
 			p.internalFlushCurrentBatch()
 		}
@@ -796,10 +802,10 @@ func (p *partitionProducer) internalSingleSend(
 	payloadBuf := internal.NewBuffer(len(compressedPayload))
 	payloadBuf.Write(compressedPayload)
 
-	buffer := p.GetBuffer()
-	if buffer == nil {
-		buffer = internal.NewBuffer(int(payloadBuf.ReadableBytes() * 3 / 2))
-	}
+	buffer := buffersPool.GetBuffer(int(payloadBuf.ReadableBytes() * 3 / 2))
+	bufferCount := p.client.metrics.SendingBuffersCount
+	bufferCount.Inc()
+	buffer.SetReleaseCallback(func() { bufferCount.Dec() })
 
 	sid := *mm.SequenceId
 	var useTxn bool
@@ -837,15 +843,15 @@ func (p *partitionProducer) internalSingleSend(
 
 type pendingItem struct {
 	sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	buffer        internal.Buffer
-	sequenceID    uint64
-	createdAt     time.Time
-	sentAt        time.Time
-	sendRequests  []interface{}
-	isDone        bool
-	flushCallback func(err error)
+	ctx            context.Context
+	cancel         context.CancelFunc
+	buffer         internal.Buffer
+	sequenceID     uint64
+	createdAt      time.Time
+	sentAt         time.Time
+	sendRequests   []interface{}
+	isDone         bool
+	flushCallbacks []func(err error)
 }
 
 func (p *partitionProducer) internalFlushCurrentBatch() {
@@ -889,6 +895,7 @@ func (p *partitionProducer) internalFlushCurrentBatch() {
 func (p *partitionProducer) writeData(buffer internal.Buffer, sequenceID uint64, callbacks []interface{}) {
 	select {
 	case <-p.ctx.Done():
+		buffer.Release()
 		for _, cb := range callbacks {
 			if sr, ok := cb.(*sendRequest); ok {
 				sr.done(nil, ErrProducerClosed)
@@ -898,7 +905,18 @@ func (p *partitionProducer) writeData(buffer internal.Buffer, sequenceID uint64,
 	default:
 		now := time.Now()
 		ctx, cancel := context.WithCancel(context.Background())
-		p.pendingQueue.Put(&pendingItem{
+		buffer.Retain()
+		p.pendingQueue.Lock()
+		defer p.pendingQueue.Unlock()
+		conn := p._getConn()
+		if p.getProducerState() == producerReady {
+			// If the producer is reconnecting, we should not write to the connection.
+			// We just need to push the buffer to the pending queue, it will be sent during the reconnecting.
+			conn.WriteData(ctx, buffer)
+		} else {
+			p.log.Debug("Skipping write to connection, producer state: ", p.getProducerState())
+		}
+		p.pendingQueue.PutUnsafe(&pendingItem{
 			ctx:          ctx,
 			cancel:       cancel,
 			createdAt:    now,
@@ -907,7 +925,6 @@ func (p *partitionProducer) writeData(buffer internal.Buffer, sequenceID uint64,
 			sequenceID:   sequenceID,
 			sendRequests: callbacks,
 		})
-		p._getConn().WriteData(ctx, buffer)
 	}
 }
 
@@ -920,8 +937,7 @@ func (p *partitionProducer) failTimeoutMessages() {
 	defer t.Stop()
 
 	for range t.C {
-		state := p.getProducerState()
-		if state == producerClosing || state == producerClosed {
+		if p.isClosingOrClosed() {
 			return
 		}
 
@@ -1060,10 +1076,10 @@ func (p *partitionProducer) internalFlush(fr *flushRequest) {
 		return
 	}
 
-	pi.flushCallback = func(err error) {
+	pi.flushCallbacks = append(pi.flushCallbacks, func(err error) {
 		fr.err = err
 		close(fr.doneCh)
-	}
+	})
 }
 
 // clearPendingSendRequests makes sure to push forward previous sending requests
@@ -1319,8 +1335,13 @@ func (p *partitionProducer) internalSendAsync(
 		return
 	}
 
-	if p.getProducerState() != producerReady {
+	if p.isClosingOrClosed() {
 		sr.done(nil, ErrProducerClosed)
+		return
+	}
+
+	if err := ctx.Err(); err != nil {
+		sr.done(nil, ctx.Err())
 		return
 	}
 
@@ -1352,7 +1373,13 @@ func (p *partitionProducer) internalSendAsync(
 		return
 	}
 
-	p.dataChan <- sr
+	select {
+	case <-ctx.Done():
+		sr.done(nil, ctx.Err())
+		return
+	case p.dataChan <- sr:
+		return
+	}
 }
 
 func (p *partitionProducer) ReceivedSendReceipt(response *pb.CommandSendReceipt) {
@@ -1437,7 +1464,7 @@ func (p *partitionProducer) internalClose(req *closeProducer) {
 }
 
 func (p *partitionProducer) doClose(reason error) {
-	if !p.casProducerState(producerReady, producerClosing) {
+	if !p.casProducerState(producerReady, producerClosing) && !p.casProducerState(producerConnecting, producerClosing) {
 		return
 	}
 
@@ -1518,7 +1545,7 @@ func (p *partitionProducer) Flush() error {
 }
 
 func (p *partitionProducer) FlushWithCtx(ctx context.Context) error {
-	if p.getProducerState() != producerReady {
+	if p.isClosingOrClosed() {
 		return ErrProducerClosed
 	}
 
@@ -1545,6 +1572,11 @@ func (p *partitionProducer) getProducerState() producerState {
 	return producerState(p.state.Load())
 }
 
+func (p *partitionProducer) isClosingOrClosed() bool {
+	state := p.getProducerState()
+	return state == producerClosing || state == producerClosed
+}
+
 func (p *partitionProducer) setProducerState(state producerState) {
 	p.state.Swap(int32(state))
 }
@@ -1556,8 +1588,8 @@ func (p *partitionProducer) casProducerState(oldState, newState producerState) b
 }
 
 func (p *partitionProducer) Close() {
-	if p.getProducerState() != producerReady {
-		// Producer is closing
+	if p.isClosingOrClosed() {
+		// Producer is closing or closed
 		return
 	}
 
@@ -1744,9 +1776,9 @@ func (i *pendingItem) done(err error) {
 
 	i.isDone = true
 	// return the buffer to the pool after all callbacks have been called.
-	defer buffersPool.Put(i.buffer)
-	if i.flushCallback != nil {
-		i.flushCallback(err)
+	defer i.buffer.Release()
+	for _, callback := range i.flushCallbacks {
+		callback(err)
 	}
 
 	if i.cancel != nil {
@@ -1757,16 +1789,16 @@ func (i *pendingItem) done(err error) {
 // _setConn sets the internal connection field of this partition producer atomically.
 // Note: should only be called by this partition producer when a new connection is available.
 func (p *partitionProducer) _setConn(conn internal.Connection) {
-	p.conn.Store(conn)
+	p.conn.Store(&conn)
 }
 
 // _getConn returns internal connection field of this partition producer atomically.
 // Note: should only be called by this partition producer before attempting to use the connection
 func (p *partitionProducer) _getConn() internal.Connection {
-	// Invariant: p.conn must be non-nil for the lifetime of the partitionProducer.
+	// Invariant: The conn must be non-nil for the lifetime of the partitionProducer.
 	//            For this reason we leave this cast unchecked and panic() if the
 	//            invariant is broken
-	return p.conn.Load().(internal.Connection)
+	return *p.conn.Load()
 }
 
 type chunkRecorder struct {

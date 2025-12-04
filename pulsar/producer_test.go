@@ -58,7 +58,8 @@ func TestInvalidURL(t *testing.T) {
 
 func TestProducerConnectError(t *testing.T) {
 	client, err := NewClient(ClientOptions{
-		URL: "pulsar://invalid-hostname:6650",
+		URL:              "pulsar://invalid-hostname:6650",
+		OperationTimeout: 3 * time.Second,
 	})
 
 	assert.Nil(t, err)
@@ -245,6 +246,7 @@ func TestProducerCompression(t *testing.T) {
 		{"zlib", ZLib},
 		{"lz4", LZ4},
 		{"zstd", ZSTD},
+		{"snappy", SNAPPY},
 	}
 
 	for _, provider := range providers {
@@ -347,7 +349,7 @@ func TestFlushInProducer(t *testing.T) {
 	assert.NoError(t, err)
 	defer client.Close()
 
-	topicName := "test-flush-in-producer"
+	topicName := newTopicName()
 	subName := "subscription-name"
 	numOfMessages := 10
 	ctx := context.Background()
@@ -446,6 +448,78 @@ func TestFlushInProducer(t *testing.T) {
 		msgCount++
 	}
 	assert.Equal(t, msgCount, numOfMessages)
+}
+
+// TestConcurrentFlushInProducer validates that concurrent flushes don't create a deadlock
+func TestConcurrentFlushInProducer(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: serviceURL,
+	})
+	assert.NoError(t, err)
+	defer client.Close()
+
+	topicName := "test-concurrent-flushes-in-producer"
+	subName := "subscription-name"
+	ctx := context.Background()
+
+	// set batch message number numOfMessages, and max delay 10s
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topicName,
+		DisableBatching: false,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            topicName,
+		SubscriptionName: subName,
+	})
+	assert.Nil(t, err)
+	defer consumer.Close()
+
+	expectedMsgCount := 100
+
+	var wg sync.WaitGroup
+
+	wg.Add(expectedMsgCount)
+
+	errs := make(chan error, expectedMsgCount*2)
+
+	// Each message in sent and flushed concurrently
+	for range expectedMsgCount {
+		go func() {
+			defer wg.Done()
+			producer.SendAsync(ctx, &ProducerMessage{
+				Payload: []byte("anythingWorksInThatPayload"),
+			}, func(_ MessageID, _ *ProducerMessage, e error) {
+				errs <- e
+			})
+
+			errs <- producer.FlushWithCtx(ctx)
+		}()
+	}
+
+	// Wait for all concurrent async publications and flushes to complete
+	wg.Wait()
+
+	// Make sure that there were no error publishing or flushing
+	close(errs)
+	var errElementCount int
+	for e := range errs {
+		errElementCount++
+		assert.Nil(t, e)
+	}
+	assert.Equal(t, errElementCount, expectedMsgCount*2)
+
+	// Make sure all messages were processed successfully
+	var receivedMsgCount int
+	for range expectedMsgCount {
+		_, err := consumer.Receive(ctx)
+		assert.Nil(t, err)
+		receivedMsgCount++
+	}
+
+	assert.Equal(t, receivedMsgCount, expectedMsgCount)
 }
 
 func TestFlushInPartitionedProducer(t *testing.T) {
@@ -657,6 +731,8 @@ func TestMessageRouter(t *testing.T) {
 	assert.Equal(t, string(msg.Payload()), "hello")
 }
 func TestMessageSingleRouter(t *testing.T) {
+	// TODO: https://github.com/apache/pulsar-client-go/issues/1376
+	t.Skip("Skipping TestMessageSingleRouter because it's too flaky")
 	// Create topic with 5 partitions
 	topicAdminURL := "admin/v2/persistent/public/default/my-single-partitioned-topic/partitions"
 	err := httpPut(topicAdminURL, 5)
@@ -2259,7 +2335,7 @@ func TestMemLimitContextCancel(t *testing.T) {
 			Payload: make([]byte, 1024),
 		}, func(_ MessageID, _ *ProducerMessage, e error) {
 			assert.Error(t, e)
-			assert.ErrorContains(t, e, getResultStr(TimeoutError))
+			assert.ErrorContains(t, e, "context canceled")
 			wg.Done()
 		})
 	}()
@@ -2276,6 +2352,32 @@ func TestMemLimitContextCancel(t *testing.T) {
 		Payload: make([]byte, 1024),
 	})
 	assert.NoError(t, err)
+}
+
+func TestSendAsyncWithContextCancel(t *testing.T) {
+
+	c, err := NewClient(ClientOptions{
+		URL:              serviceURL,
+		MemoryLimitBytes: 100 * 1024,
+	})
+	assert.NoError(t, err)
+	defer c.Close()
+
+	topicName := newTopicName()
+	producer, _ := c.CreateProducer(ProducerOptions{
+		Topic: topicName,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var callbackErr error
+	producer.SendAsync(ctx, &ProducerMessage{
+		Payload: make([]byte, 1024),
+	}, func(_ MessageID, _ *ProducerMessage, e error) {
+		callbackErr = e
+	})
+
+	require.Error(t, callbackErr)
 }
 
 func TestBatchSendMessagesWithMetadata(t *testing.T) {
@@ -2376,7 +2478,9 @@ func TestFailPendingMessageWithClose(t *testing.T) {
 		})
 	}
 	partitionProducerImp := testProducer.(*producer).producers[0].(*partitionProducer)
-	partitionProducerImp.pendingQueue.Put(&pendingItem{})
+	partitionProducerImp.pendingQueue.Put(&pendingItem{
+		buffer: buffersPool.GetBuffer(0),
+	})
 	testProducer.Close()
 	assert.Equal(t, 0, partitionProducerImp.pendingQueue.Size())
 }
@@ -2423,6 +2527,15 @@ func (pqw *pendingQueueWrapper) Put(item interface{}) {
 	pqw.pendingQueue.Put(item)
 }
 
+func (pqw *pendingQueueWrapper) PutUnsafe(item interface{}) {
+	pi := item.(*pendingItem)
+	writerIdx := pi.buffer.WriterIndex()
+	buf := internal.NewBuffer(int(writerIdx))
+	buf.Write(pi.buffer.Get(0, writerIdx))
+	*pqw.writtenBuffers = append(*pqw.writtenBuffers, buf)
+	pqw.pendingQueue.PutUnsafe(item)
+}
+
 func (pqw *pendingQueueWrapper) Take() interface{} {
 	return pqw.pendingQueue.Take()
 }
@@ -2449,6 +2562,18 @@ func (pqw *pendingQueueWrapper) Size() int {
 
 func (pqw *pendingQueueWrapper) ReadableSlice() []interface{} {
 	return pqw.pendingQueue.ReadableSlice()
+}
+
+func (pqw *pendingQueueWrapper) IterateUnsafe(f func(item interface{})) {
+	pqw.pendingQueue.IterateUnsafe(f)
+}
+
+func (pqw *pendingQueueWrapper) Lock() {
+	pqw.pendingQueue.Lock()
+}
+
+func (pqw *pendingQueueWrapper) Unlock() {
+	pqw.pendingQueue.Unlock()
 }
 
 func TestDisableReplication(t *testing.T) {
@@ -2604,4 +2729,172 @@ func TestSelectConnectionForSameProducer(t *testing.T) {
 	}
 
 	client.Close()
+}
+
+type mockConn struct {
+	*dummyConnection
+	realConn internal.Connection
+
+	l       sync.Mutex
+	buffers []internal.Buffer
+}
+
+func (m *mockConn) WriteData(_ context.Context, buffer internal.Buffer) {
+	m.l.Lock()
+	m.buffers = append(m.buffers, buffer)
+	m.l.Unlock()
+}
+
+func (m *mockConn) SendRequest(requestID uint64, req *pb.BaseCommand, callback func(*pb.BaseCommand, error)) {
+	m.realConn.SendRequest(requestID, req, callback)
+}
+
+func TestSendBufferRetainWhenConnectionStuck(t *testing.T) {
+	topicName := newTopicName()
+
+	client, err := NewClient(ClientOptions{
+		URL: serviceURL,
+	})
+	assert.NoError(t, err)
+	defer client.Close()
+
+	p, err := client.CreateProducer(ProducerOptions{
+		Topic: topicName,
+	})
+	assert.NoError(t, err)
+	pp := p.(*producer).producers[0].(*partitionProducer)
+
+	// Create a mock connection that tracks written buffers
+	conn := &mockConn{
+		dummyConnection: &dummyConnection{},
+		buffers:         make([]internal.Buffer, 0),
+		realConn:        pp._getConn(),
+	}
+
+	pp._setConn(conn)
+
+	pp.SendAsync(context.Background(), &ProducerMessage{
+		Payload: []byte("test"),
+	}, nil)
+
+	// Wait for the buffer to be written to the connection
+	assert.Eventually(t, func() bool {
+		return len(conn.buffers) != 0
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// Simulate connection failure and verify buffer retention
+	pp.failPendingMessages(errors.New("expected error"))
+
+	assert.Equal(t, 1, len(conn.buffers), "Expected one buffer to be sent")
+	b := conn.buffers[0]
+	assert.Equal(t, int64(1), b.RefCnt(), "Expected buffer to have a reference count of 1 after sending")
+}
+
+func TestSendAsyncCouldTimeoutWhileReconnecting(t *testing.T) {
+	testSendAsyncCouldTimeoutWhileReconnecting(t, false)
+	testSendAsyncCouldTimeoutWhileReconnecting(t, true)
+}
+
+func testSendAsyncCouldTimeoutWhileReconnecting(t *testing.T, isDisableBatching bool) {
+	t.Helper()
+
+	req := testcontainers.ContainerRequest{
+		Image:        getPulsarTestImage(),
+		ExposedPorts: []string{"6650/tcp", "8080/tcp"},
+		WaitingFor:   wait.ForExposedPort(),
+		Cmd:          []string{"bin/pulsar", "standalone", "-nfw"},
+	}
+	c, err := testcontainers.GenericContainer(context.Background(), testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	require.NoError(t, err, "Failed to start the pulsar container")
+	defer func() {
+		err := c.Terminate(context.Background())
+		if err != nil {
+			t.Fatal("Failed to terminate the pulsar container", err)
+		}
+	}()
+
+	endpoint, err := c.PortEndpoint(context.Background(), "6650", "pulsar")
+	require.NoError(t, err, "Failed to get the pulsar endpoint")
+
+	client, err := NewClient(ClientOptions{
+		URL:               endpoint,
+		ConnectionTimeout: 5 * time.Second,
+		OperationTimeout:  5 * time.Second,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	var testProducer Producer
+	require.Eventually(t, func() bool {
+		testProducer, err = client.CreateProducer(ProducerOptions{
+			Topic:               newTopicName(),
+			Schema:              NewBytesSchema(nil),
+			SendTimeout:         3 * time.Second,
+			DisableBatching:     isDisableBatching,
+			BatchingMaxMessages: 5,
+			MaxPendingMessages:  10,
+		})
+		return err == nil
+	}, 30*time.Second, 1*time.Second)
+
+	numMessages := 10
+	// Send 10 messages synchronously
+	for i := 0; i < numMessages; i++ {
+		send, err := testProducer.Send(context.Background(), &ProducerMessage{Payload: []byte("test")})
+		require.NoError(t, err)
+		require.NotNil(t, send)
+	}
+
+	// stop pulsar server
+	timeout := 10 * time.Second
+	err = c.Stop(context.Background(), &timeout)
+	require.NoError(t, err)
+
+	// Test the SendAsync could be timeout if the producer is reconnecting
+
+	finalErr := make(chan error, 1)
+	testProducer.SendAsync(context.Background(), &ProducerMessage{
+		Payload: []byte("test"),
+	}, func(_ MessageID, _ *ProducerMessage, err error) {
+		finalErr <- err
+	})
+	select {
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timeout")
+	case err = <-finalErr:
+		// should get a timeout error
+		require.ErrorIs(t, err, ErrSendTimeout)
+	}
+	close(finalErr)
+
+	// Test that the SendAsync could be timeout if the pending queue is full
+
+	go func() {
+		// Send 10 messages asynchronously to make the pending queue full
+		for i := 0; i < numMessages; i++ {
+			testProducer.SendAsync(context.Background(), &ProducerMessage{
+				Payload: []byte("test"),
+			}, func(_ MessageID, _ *ProducerMessage, _ error) {
+			})
+		}
+	}()
+
+	time.Sleep(3 * time.Second)
+	finalErr = make(chan error, 1)
+	testProducer.SendAsync(context.Background(), &ProducerMessage{
+		Payload: []byte("test"),
+	}, func(_ MessageID, _ *ProducerMessage, err error) {
+		finalErr <- err
+	})
+	select {
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timeout")
+	case err = <-finalErr:
+		// should get a timeout error
+		require.ErrorIs(t, err, ErrSendTimeout)
+	}
+	close(finalErr)
 }

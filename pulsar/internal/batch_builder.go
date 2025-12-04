@@ -29,15 +29,11 @@ import (
 	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
-type BuffersPool interface {
-	GetBuffer() Buffer
-}
-
 // BatcherBuilderProvider defines func which returns the BatchBuilder.
 type BatcherBuilderProvider func(
 	maxMessages uint, maxBatchSize uint, maxMessageSize uint32, producerName string, producerID uint64,
 	compressionType pb.CompressionType, level compression.Level,
-	bufferPool BuffersPool, logger log.Logger, encryptor crypto.Encryptor,
+	bufferPool BuffersPool, metrics *Metrics, logger log.Logger, encryptor crypto.Encryptor,
 ) (BatchBuilder, error)
 
 // BatchBuilder is a interface of batch builders
@@ -104,6 +100,7 @@ type batchContainer struct {
 
 	compressionProvider compression.Provider
 	buffersPool         BuffersPool
+	metrics             *Metrics
 
 	log log.Logger
 
@@ -114,7 +111,7 @@ type batchContainer struct {
 func newBatchContainer(
 	maxMessages uint, maxBatchSize uint, maxMessageSize uint32, producerName string, producerID uint64,
 	compressionType pb.CompressionType, level compression.Level,
-	bufferPool BuffersPool, logger log.Logger, encryptor crypto.Encryptor,
+	bufferPool BuffersPool, metrics *Metrics, logger log.Logger, encryptor crypto.Encryptor,
 ) batchContainer {
 
 	bc := batchContainer{
@@ -137,6 +134,7 @@ func newBatchContainer(
 		callbacks:           []interface{}{},
 		compressionProvider: GetCompressionProvider(compressionType, level),
 		buffersPool:         bufferPool,
+		metrics:             metrics,
 		log:                 logger,
 		encryptor:           encryptor,
 	}
@@ -152,12 +150,12 @@ func newBatchContainer(
 func NewBatchBuilder(
 	maxMessages uint, maxBatchSize uint, maxMessageSize uint32, producerName string, producerID uint64,
 	compressionType pb.CompressionType, level compression.Level,
-	bufferPool BuffersPool, logger log.Logger, encryptor crypto.Encryptor,
+	bufferPool BuffersPool, metrics *Metrics, logger log.Logger, encryptor crypto.Encryptor,
 ) (BatchBuilder, error) {
 
 	bc := newBatchContainer(
 		maxMessages, maxBatchSize, maxMessageSize, producerName, producerID, compressionType,
-		level, bufferPool, logger, encryptor,
+		level, bufferPool, metrics, logger, encryptor,
 	)
 
 	return &bc, nil
@@ -269,10 +267,10 @@ func (bc *batchContainer) Flush() *FlushBatch {
 	uncompressedSize := bc.buffer.ReadableBytes()
 	bc.msgMetadata.UncompressedSize = &uncompressedSize
 
-	buffer := bc.buffersPool.GetBuffer()
-	if buffer == nil {
-		buffer = NewBuffer(int(uncompressedSize * 3 / 2))
-	}
+	buffer := bc.buffersPool.GetBuffer(int(uncompressedSize * 3 / 2))
+	bufferCount := bc.metrics.SendingBuffersCount
+	bufferCount.Inc()
+	buffer.SetReleaseCallback(func() { bufferCount.Dec() })
 
 	sequenceID := uint64(0)
 	var err error
@@ -320,6 +318,8 @@ func GetCompressionProvider(
 		return compression.NewZLibProvider()
 	case pb.CompressionType_ZSTD:
 		return compression.NewZStdProvider(level)
+	case pb.CompressionType_SNAPPY:
+		return compression.NewSnappyProvider()
 	default:
 		panic("unsupported compression type")
 	}

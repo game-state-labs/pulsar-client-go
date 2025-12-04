@@ -23,11 +23,8 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/utils"
 
 	"github.com/apache/pulsar-client-go/pulsar/crypto"
 	"github.com/apache/pulsar-client-go/pulsar/internal"
@@ -74,6 +71,11 @@ type consumer struct {
 }
 
 func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
+
+	if options.RetryEnable && options.EnableZeroQueueConsumer {
+		return nil, newError(InvalidConfiguration, "ZeroQueueConsumer is not supported with RetryEnable")
+	}
+
 	if options.Topic == "" && options.Topics == nil && options.TopicsPattern == "" {
 		return nil, newError(TopicNotFound, "topic is required")
 	}
@@ -176,7 +178,15 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		}
 	}
 
-	dlq, err := newDlqRouter(client, options.DLQ, options.Topic, options.SubscriptionName, options.Name,
+	var sourceTopic string
+	if options.RetryEnable && len(options.Topics) == 2 && options.Topics[1] == options.DLQ.RetryLetterTopic {
+		//	when RetryEnable=true, options.Topic and RetryLetterTopic will be appended to the options.Topics
+		//	we need to try to find previous options.Topic from options.Topics
+		sourceTopic = options.Topics[0]
+	} else {
+		sourceTopic = options.Topic
+	}
+	dlq, err := newDlqRouter(client, options.DLQ, sourceTopic, options.SubscriptionName, options.Name,
 		options.BackOffPolicyFunc, client.log)
 	if err != nil {
 		return nil, err
@@ -253,11 +263,6 @@ func newInternalConsumer(client *client, options ConsumerOptions, topic string,
 	}
 
 	if len(partitions) > 1 && options.EnableZeroQueueConsumer {
-		return nil, pkgerrors.New("ZeroQueueConsumer is not supported for partitioned topics")
-	}
-
-	if len(partitions) == 1 && options.EnableZeroQueueConsumer &&
-		strings.Contains(partitions[0], utils.PARTITIONEDTOPICSUFFIX) {
 		return nil, pkgerrors.New("ZeroQueueConsumer is not supported for partitioned topics")
 	}
 
@@ -468,6 +473,7 @@ func newPartitionConsumerOpts(topic, consumerName string, idx int, options Consu
 		enableBatchIndexAck:         options.EnableBatchIndexAcknowledgment,
 		ackGroupingOptions:          options.AckGroupingOptions,
 		autoReceiverQueueSize:       options.EnableAutoScaledReceiverQueueSize,
+		enableZeroQueueConsumer:     options.EnableZeroQueueConsumer,
 	}
 }
 
@@ -659,16 +665,21 @@ func (c *consumer) ReconsumeLaterWithCustomProperties(msg Message, customPropert
 	} else {
 		props[SysPropertyRealTopic] = msg.Topic()
 		props[SysPropertyOriginMessageID] = msgID.messageID.String()
+		props[PropertyOriginMessageID] = msgID.messageID.String()
 	}
 	props[SysPropertyReconsumeTimes] = strconv.Itoa(reconsumeTimes)
 	props[SysPropertyDelayTime] = fmt.Sprintf("%d", int64(delay)/1e6)
 
 	consumerMsg := ConsumerMessage{
 		Consumer: c,
+		// Copy msgID so that dlq/rlq router can ack this msg after successfully sent to new topic
 		Message: &message{
-			payLoad:    msg.Payload(),
-			properties: props,
-			msgID:      msgID,
+			payLoad:     msg.Payload(),
+			key:         msg.Key(),
+			orderingKey: msg.OrderingKey(),
+			properties:  props,
+			eventTime:   msg.EventTime(),
+			msgID:       msgID,
 		},
 	}
 	if uint32(reconsumeTimes) > c.dlq.policy.MaxDeliveries {
@@ -682,6 +693,7 @@ func (c *consumer) ReconsumeLaterWithCustomProperties(msg Message, customPropert
 				OrderingKey:  msg.OrderingKey(),
 				Properties:   props,
 				DeliverAfter: delay,
+				EventTime:    msg.EventTime(),
 			},
 		}
 	}
