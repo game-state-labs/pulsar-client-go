@@ -19,9 +19,10 @@ package pulsar
 
 import (
 	"fmt"
-	"net/url"
 	"sync"
 	"time"
+
+	"errors"
 
 	"github.com/apache/pulsar-client-go/pulsar/auth"
 	"github.com/apache/pulsar-client-go/pulsar/internal"
@@ -38,6 +39,8 @@ const (
 	defaultConnMaxIdleTime             = 180 * time.Second
 	minConnMaxIdleTime                 = 60 * time.Second
 )
+
+var ErrClientTransactionsNotEnabled = errors.New("transactions are not enabled with the client")
 
 type client struct {
 	cnxPool          internal.ConnectionPool
@@ -76,31 +79,31 @@ func newClient(options ClientOptions) (Client, error) {
 		return nil, newError(InvalidConfiguration, "URL is required for client")
 	}
 
-	url, err := url.Parse(options.URL)
+	pulsarServiceURI, err := internal.NewPulsarServiceURIFromURIString(options.URL)
 	if err != nil {
 		logger.WithError(err).Error("Failed to parse service URL")
 		return nil, newError(InvalidConfiguration, "Invalid service URL")
 	}
 
 	var tlsConfig *internal.TLSOptions
-	switch url.Scheme {
-	case "pulsar", "http":
-		tlsConfig = nil
-	case "pulsar+ssl", "https":
+	if pulsarServiceURI.UseTLS() {
+		hostName, err := pulsarServiceURI.PrimaryHostName()
+		if err != nil {
+			return nil, err
+		}
+
 		tlsConfig = &internal.TLSOptions{
 			AllowInsecureConnection: options.TLSAllowInsecureConnection,
 			KeyFile:                 options.TLSKeyFilePath,
 			CertFile:                options.TLSCertificateFile,
 			TrustCertsFilePath:      options.TLSTrustCertsFilePath,
 			ValidateHostname:        options.TLSValidateHostname,
-			ServerName:              url.Hostname(),
+			ServerName:              hostName,
 			CipherSuites:            options.TLSCipherSuites,
 			MinVersion:              options.TLSMinVersion,
 			MaxVersion:              options.TLSMaxVersion,
 			TLSConfig:               options.TLSConfig,
 		}
-	default:
-		return nil, newError(InvalidConfiguration, fmt.Sprintf("Invalid URL scheme '%s'", url.Scheme))
 	}
 
 	var authProvider auth.Provider
@@ -171,10 +174,16 @@ func newClient(options ClientOptions) (Client, error) {
 		tlsEnabled:       tlsConfig != nil,
 	}
 
-	c.rpcClient = internal.NewRPCClient(url, c.cnxPool, operationTimeout, logger, metrics,
+	c.rpcClient, err = internal.NewRPCClient(options.URL, c.cnxPool, operationTimeout, logger, metrics,
 		options.ListenerName, tlsConfig, authProvider, toKeyValues(options.LookupProperties))
+	if err != nil {
+		return nil, err
+	}
 
-	c.lookupService = c.rpcClient.LookupService("")
+	c.lookupService, err = c.rpcClient.LookupService("")
+	if err != nil {
+		return nil, err
+	}
 
 	c.handlers = internal.NewClientHandlers()
 
@@ -190,6 +199,10 @@ func newClient(options ClientOptions) (Client, error) {
 }
 
 func (c *client) NewTransaction(timeout time.Duration) (Transaction, error) {
+	if c.tcClient == nil {
+		return nil, ErrClientTransactionsNotEnabled
+	}
+
 	id, err := c.tcClient.newTransaction(timeout)
 	if err != nil {
 		return nil, err

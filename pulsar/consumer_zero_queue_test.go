@@ -21,8 +21,18 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
+	"net/netip"
+	"os"
 	"testing"
 	"time"
+
+	plog "github.com/apache/pulsar-client-go/pulsar/log"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal"
 	"github.com/apache/pulsar-client-go/pulsaradmin"
@@ -30,6 +40,26 @@ import (
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/utils"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestRetryEnableZeroQueueConsumer(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+
+	// create consumer
+	_, err = client.Subscribe(ConsumerOptions{
+		Topic:                   topic,
+		SubscriptionName:        "my-sub",
+		RetryEnable:             true,
+		EnableZeroQueueConsumer: true,
+	})
+	assert.ErrorContains(t, err, "ZeroQueueConsumer is not supported with RetryEnable")
+}
 
 func TestNormalZeroQueueConsumer(t *testing.T) {
 	client, err := NewClient(ClientOptions{
@@ -89,11 +119,366 @@ func TestNormalZeroQueueConsumer(t *testing.T) {
 		assert.Equal(t, "pulsar", msg.Key())
 		assert.Equal(t, expectProperties, msg.Properties())
 		// ack message
-		consumer.Ack(msg)
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
 		log.Printf("receive message: %s", msg.ID().String())
 	}
 	err = consumer.Unsubscribe()
 	assert.Nil(t, err)
+}
+func TestReconnectConsumer(t *testing.T) {
+
+	req := testcontainers.ContainerRequest{
+		Name:         "pulsar-test",
+		Image:        getPulsarTestImage(),
+		ExposedPorts: []string{"6650/tcp", "8080/tcp"},
+		WaitingFor:   wait.ForExposedPort(),
+		HostConfigModifier: func(config *container.HostConfig) {
+			ip := netip.IPv4Unspecified()
+			p6650, err := network.ParsePort("6650/tcp")
+			require.NoError(t, err)
+			p8080, err := network.ParsePort("8080/tcp")
+			require.NoError(t, err)
+			config.PortBindings = network.PortMap{
+				p6650: {{HostIP: ip, HostPort: "6659"}},
+				p8080: {{HostIP: ip, HostPort: "8089"}},
+			}
+		},
+		Cmd: []string{"bin/pulsar", "standalone", "-nfw", "--advertised-address", "localhost"},
+	}
+	c, err := testcontainers.GenericContainer(context.Background(), testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+		Reuse:            true,
+	})
+	require.NoError(t, err, "Failed to start the pulsar container")
+	endpoint, err := c.PortEndpoint(context.Background(), "6650", "pulsar")
+	require.NoError(t, err, "Failed to get the pulsar endpoint")
+
+	client, err := NewClient(ClientOptions{
+		URL: endpoint,
+	})
+	assert.Nil(t, err)
+	adminEndpoint, err := c.PortEndpoint(context.Background(), "8080", "http")
+	assert.Nil(t, err)
+	admin, err := pulsaradmin.NewClient(&config.Config{
+		WebServiceURL: adminEndpoint,
+	})
+	assert.Nil(t, err)
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	ctx := context.Background()
+	var consumer Consumer
+	require.Eventually(t, func() bool {
+		consumer, err = client.Subscribe(ConsumerOptions{
+			Topic:                   topic,
+			SubscriptionName:        "my-sub",
+			EnableZeroQueueConsumer: true,
+		})
+		return err == nil
+	}, 30*time.Second, 1*time.Second)
+
+	assert.Nil(t, err)
+	_, ok := consumer.(*zeroQueueConsumer)
+	assert.True(t, ok)
+	defer consumer.Close()
+
+	// create producer
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: false,
+	})
+	assert.Nil(t, err)
+
+	// send 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := producer.Send(ctx, &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+			Key:     "pulsar",
+			Properties: map[string]string{
+				"key-1": "pulsar-1",
+			},
+		})
+		assert.Nil(t, err)
+		log.Printf("send message: %s", msg.String())
+	}
+
+	ch := make(chan struct{})
+
+	go func() {
+		time.Sleep(3 * time.Second)
+		log.Println("unloading topic")
+		topicName, err := utils.GetTopicName(topic)
+		assert.Nil(t, err)
+		// unload topic to trigger consumer reconnect
+		err = admin.Topics().Unload(*topicName)
+		assert.Nil(t, err)
+		log.Println("unloaded topic")
+		ch <- struct{}{}
+	}()
+
+	// receive 10 messages
+	for i := 0; i < 10; i++ {
+		if i == 3 {
+			<-ch
+		}
+		msg, err := consumer.Receive(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		expectMsg := fmt.Sprintf("hello-%d", i)
+		expectProperties := map[string]string{
+			"key-1": "pulsar-1",
+		}
+		assert.Equal(t, []byte(expectMsg), msg.Payload())
+		assert.Equal(t, "pulsar", msg.Key())
+		assert.Equal(t, expectProperties, msg.Properties())
+		// ack message
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
+		log.Printf("receive message: %s", msg.ID().String())
+	}
+	err = consumer.Unsubscribe()
+	assert.Nil(t, err)
+	consumer.Close()
+	producer.Close()
+	defer c.Terminate(ctx)
+}
+
+func TestReconnectedBrokerSendPermits(t *testing.T) {
+	req := testcontainers.ContainerRequest{
+		Name:         "pulsar-test",
+		Image:        getPulsarTestImage(),
+		ExposedPorts: []string{"6650/tcp", "8080/tcp"},
+		WaitingFor:   wait.ForExposedPort(),
+		HostConfigModifier: func(config *container.HostConfig) {
+			ip := netip.IPv4Unspecified()
+			p6650, err := network.ParsePort("6650/tcp")
+			require.NoError(t, err)
+			p8080, err := network.ParsePort("8080/tcp")
+			require.NoError(t, err)
+			config.PortBindings = network.PortMap{
+				p6650: {{HostIP: ip, HostPort: "6659"}},
+				p8080: {{HostIP: ip, HostPort: "8089"}},
+			}
+		},
+		Cmd: []string{"bin/pulsar", "standalone", "-nfw", "--advertised-address", "localhost"},
+	}
+	c, err := testcontainers.GenericContainer(context.Background(), testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+		Reuse:            true,
+	})
+	require.NoError(t, err, "Failed to start the pulsar container")
+	endpoint, err := c.PortEndpoint(context.Background(), "6650", "pulsar")
+	require.NoError(t, err, "Failed to get the pulsar endpoint")
+
+	sLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := NewClient(ClientOptions{
+		URL:    endpoint,
+		Logger: plog.NewLoggerWithSlog(sLogger),
+	})
+	assert.Nil(t, err)
+	adminEndpoint, err := c.PortEndpoint(context.Background(), "8080", "http")
+	assert.Nil(t, err)
+	admin, err := pulsaradmin.NewClient(&config.Config{
+		WebServiceURL: adminEndpoint,
+	})
+	assert.Nil(t, err)
+
+	topic := newTopicName()
+	var consumer Consumer
+	require.Eventually(t, func() bool {
+		consumer, err = client.Subscribe(ConsumerOptions{
+			Topic:                   topic,
+			SubscriptionName:        "my-sub",
+			EnableZeroQueueConsumer: true,
+			Type:                    Shared, // using Shared subscription type to support unack subscription stats
+		})
+		return err == nil
+	}, 30*time.Second, 1*time.Second)
+	ctx := context.Background()
+
+	// create producer
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: false,
+	})
+	assert.Nil(t, err)
+
+	// send 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := producer.Send(ctx, &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+			Key:     "pulsar",
+			Properties: map[string]string{
+				"key-1": "pulsar-1",
+			},
+		})
+		assert.Nil(t, err)
+		log.Printf("send message: %s", msg.String())
+	}
+
+	log.Println("unloading topic")
+	topicName, err := utils.GetTopicName(topic)
+	assert.Nil(t, err)
+	err = admin.Topics().Unload(*topicName)
+	assert.Nil(t, err)
+	log.Println("unloaded topic")
+	zc, ok := consumer.(*zeroQueueConsumer)
+	assert.True(t, ok)
+	// wait for reconnect
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		reconnectCount := zc.pc.reconnectCount.Load()
+		require.Equal(c, reconnectCount, int32(1))
+	}, 30*time.Second, 1*time.Second)
+
+	// receive 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := consumer.Receive(context.Background())
+		if err != nil {
+			assert.Nil(t, err)
+		}
+
+		expectMsg := fmt.Sprintf("hello-%d", i)
+		expectProperties := map[string]string{
+			"key-1": "pulsar-1",
+		}
+		assert.Equal(t, []byte(expectMsg), msg.Payload())
+		assert.Equal(t, "pulsar", msg.Key())
+		assert.Equal(t, expectProperties, msg.Properties())
+		// ack message
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
+		log.Printf("receive message: %s", msg.ID().String())
+	}
+	//	send one more message and we do not manually receive it
+	_, err = producer.Send(ctx, &ProducerMessage{
+		Payload: []byte(fmt.Sprintf("hello-%d", 10)),
+		Key:     "pulsar",
+		Properties: map[string]string{
+			"key-1": "pulsar-1",
+		},
+	})
+	assert.Nil(t, err)
+	//	wait for broker send messages to consumer and topic stats update finish
+	option := utils.GetStatsOptions{
+		GetPreciseBacklog: true,
+	}
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		topicStats, err := admin.Topics().GetStatsWithOptionWithContext(ctx, *topicName, option)
+		require.Nil(c, err)
+		for _, subscriptionStats := range topicStats.Subscriptions {
+			require.Equal(c, subscriptionStats.MsgBacklog, int64(1))
+			require.Equal(c, subscriptionStats.Consumers[0].UnAckedMessages, 0)
+		}
+	}, 30*time.Second, 1*time.Second)
+
+	// ack
+	msg, err := consumer.Receive(context.Background())
+	assert.Nil(t, err)
+	err = consumer.Ack(msg)
+	assert.Nil(t, err)
+
+	// check topic stats
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		topicStats, err := admin.Topics().GetStatsWithOptionWithContext(ctx, *topicName, option)
+		require.Nil(c, err)
+		for _, subscriptionStats := range topicStats.Subscriptions {
+			require.Equal(c, subscriptionStats.MsgBacklog, int64(0))
+			require.Equal(c, subscriptionStats.Consumers[0].UnAckedMessages, 0)
+		}
+	}, 30*time.Second, 1*time.Second)
+
+}
+
+func TestUnloadTopicBeforeConsume(t *testing.T) {
+
+	sLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := NewClient(ClientOptions{
+		URL:    lookupURL,
+		Logger: plog.NewLoggerWithSlog(sLogger),
+	})
+	assert.Nil(t, err)
+	admin, err := pulsaradmin.NewClient(&config.Config{})
+	assert.Nil(t, err)
+
+	defer client.Close()
+
+	topic := newTopicName()
+	ctx := context.Background()
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:                   topic,
+		SubscriptionName:        "my-sub",
+		EnableZeroQueueConsumer: true,
+	})
+
+	assert.Nil(t, err)
+	_, ok := consumer.(*zeroQueueConsumer)
+	assert.True(t, ok)
+	defer consumer.Close()
+
+	// create producer
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: false,
+	})
+	assert.Nil(t, err)
+
+	// send 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := producer.Send(ctx, &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+			Key:     "pulsar",
+			Properties: map[string]string{
+				"key-1": "pulsar-1",
+			},
+		})
+		assert.Nil(t, err)
+		log.Printf("send message: %s", msg.String())
+	}
+
+	log.Println("unloading topic")
+	topicName, err := utils.GetTopicName(topic)
+	assert.Nil(t, err)
+	// unload topic to trigger consumer reconnect and send permits
+	err = admin.Topics().Unload(*topicName)
+	assert.Nil(t, err)
+	log.Println("unloaded topic")
+
+	// receive 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := consumer.Receive(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		expectMsg := fmt.Sprintf("hello-%d", i)
+		expectProperties := map[string]string{
+			"key-1": "pulsar-1",
+		}
+		assert.Equal(t, []byte(expectMsg), msg.Payload())
+		assert.Equal(t, "pulsar", msg.Key())
+		assert.Equal(t, expectProperties, msg.Properties())
+		// ack message
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
+		log.Printf("receive message: %s", msg.ID().String())
+	}
+	// Make sure there are no more messages
+	timeout, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = consumer.Receive(timeout)
+	assert.Equal(t, context.DeadlineExceeded, err)
+
+	err = consumer.Unsubscribe()
+	assert.Nil(t, err)
+	consumer.Close()
+	producer.Close()
 }
 
 func TestMultipleConsumer(t *testing.T) {
@@ -199,7 +584,7 @@ func TestPartitionZeroQueueConsumer(t *testing.T) {
 	assert.Nil(t, consumer)
 	assert.Error(t, err, "ZeroQueueConsumer is not supported for partitioned topics")
 }
-func TestOnePartitionZeroQueueConsumer(t *testing.T) {
+func TestSpecifiedPartitionZeroQueueConsumer(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		URL: lookupURL,
 	})
@@ -208,17 +593,65 @@ func TestOnePartitionZeroQueueConsumer(t *testing.T) {
 	defer client.Close()
 
 	topic := newTopicName()
-	err = createPartitionedTopic(topic, 1)
+	ctx := context.Background()
+	err = createPartitionedTopic(topic, 2)
+	assert.Nil(t, err)
+	topics, err := client.TopicPartitions(topic)
 	assert.Nil(t, err)
 
 	// create consumer
 	consumer, err := client.Subscribe(ConsumerOptions{
-		Topic:                   topic,
+		Topic:                   topics[1],
 		SubscriptionName:        "my-sub",
 		EnableZeroQueueConsumer: true,
 	})
-	assert.Nil(t, consumer)
-	assert.Error(t, err, "ZeroQueueConsumer is not supported for partitioned topics")
+	assert.Nil(t, err)
+	_, ok := consumer.(*zeroQueueConsumer)
+	assert.True(t, ok)
+	defer consumer.Close()
+
+	// create producer
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topics[1],
+		DisableBatching: false,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	// send 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := producer.Send(ctx, &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+			Key:     "pulsar",
+			Properties: map[string]string{
+				"key-1": "pulsar-1",
+			},
+		})
+		assert.Nil(t, err)
+		log.Printf("send message: %s", msg.String())
+	}
+
+	// receive 10 messages
+	for i := 0; i < 10; i++ {
+		msg, err := consumer.Receive(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		expectMsg := fmt.Sprintf("hello-%d", i)
+		expectProperties := map[string]string{
+			"key-1": "pulsar-1",
+		}
+		assert.Equal(t, []byte(expectMsg), msg.Payload())
+		assert.Equal(t, "pulsar", msg.Key())
+		assert.Equal(t, expectProperties, msg.Properties())
+		// ack message
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
+		log.Printf("receive message: %s", msg.ID().String())
+	}
+	err = consumer.Unsubscribe()
+	assert.Nil(t, err)
 }
 
 func TestZeroQueueConsumerGetLastMessageIDs(t *testing.T) {
@@ -434,7 +867,8 @@ func TestZeroQueueConsumer_Nack(t *testing.T) {
 
 		if i%2 == 0 {
 			// Only acks even messages
-			consumer.Ack(msg)
+			err = consumer.Ack(msg)
+			assert.Nil(t, err)
 		} else {
 			// Fails to process odd messages
 			consumer.Nack(msg)
@@ -449,7 +883,8 @@ func TestZeroQueueConsumer_Nack(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Equal(t, fmt.Sprintf("msg-content-%d", i), string(msg.Payload()))
 
-		consumer.Ack(msg)
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
 	}
 }
 
@@ -499,7 +934,8 @@ func TestZeroQueueConsumer_Seek(t *testing.T) {
 		msg, err := consumer.Receive(ctx)
 		assert.Nil(t, err)
 		assert.Equal(t, fmt.Sprintf("hello-%d", i), string(msg.Payload()))
-		consumer.Ack(msg)
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
 	}
 
 	err = consumer.Seek(seekID)
@@ -556,7 +992,8 @@ func TestZeroQueueConsumer_SeekByTime(t *testing.T) {
 		msg, err := consumer.Receive(ctx)
 		assert.Nil(t, err)
 		assert.Equal(t, fmt.Sprintf("hello-%d", i), string(msg.Payload()))
-		consumer.Ack(msg)
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
 	}
 
 	currentTimestamp := time.Now()
@@ -569,6 +1006,7 @@ func TestZeroQueueConsumer_SeekByTime(t *testing.T) {
 		msg, err := consumer.Receive(ctx)
 		assert.Nil(t, err)
 		assert.Equal(t, fmt.Sprintf("hello-%d", i), string(msg.Payload()))
-		consumer.Ack(msg)
+		err = consumer.Ack(msg)
+		assert.Nil(t, err)
 	}
 }

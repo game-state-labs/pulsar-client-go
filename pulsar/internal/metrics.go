@@ -22,14 +22,15 @@ import (
 )
 
 type Metrics struct {
-	metricsLevel      int
-	messagesPublished *prometheus.CounterVec
-	bytesPublished    *prometheus.CounterVec
-	messagesPending   *prometheus.GaugeVec
-	bytesPending      *prometheus.GaugeVec
-	publishErrors     *prometheus.CounterVec
-	publishLatency    *prometheus.HistogramVec
-	publishRPCLatency *prometheus.HistogramVec
+	metricsLevel        int
+	messagesPublished   *prometheus.CounterVec
+	bytesPublished      *prometheus.CounterVec
+	messagesPending     *prometheus.GaugeVec
+	bytesPending        *prometheus.GaugeVec
+	publishErrors       *prometheus.CounterVec
+	publishLatency      *prometheus.HistogramVec
+	publishRPCLatency   *prometheus.HistogramVec
+	SendingBuffersCount prometheus.Gauge
 
 	messagesReceived   *prometheus.CounterVec
 	bytesReceived      *prometheus.CounterVec
@@ -107,27 +108,25 @@ type LeveledMetrics struct {
 // NewMetricsProvider returns metrics registered to registerer.
 func NewMetricsProvider(metricsCardinality int, userDefinedLabels map[string]string,
 	registerer prometheus.Registerer) *Metrics {
-	constLabels := map[string]string{
-		"client": "go",
-	}
+	constLabels := map[string]string{"client": "go"}
 	for k, v := range userDefinedLabels {
 		constLabels[k] = v
 	}
-	var metricsLevelLabels []string
-
 	// note: ints here mirror MetricsCardinality in client.go to avoid import cycle
-	switch metricsCardinality {
-	case 1: //MetricsCardinalityNone
-		metricsLevelLabels = []string{}
-	case 2: //MetricsCardinalityTenant
-		metricsLevelLabels = []string{"pulsar_tenant"}
-	case 3: //MetricsCardinalityNamespace
-		metricsLevelLabels = []string{"pulsar_tenant", "pulsar_namespace"}
-	case 4: //MetricsCardinalityTopic
-		metricsLevelLabels = []string{"pulsar_tenant", "pulsar_namespace", "topic"}
-	default: //Anything else is namespace
-		metricsLevelLabels = []string{"pulsar_tenant", "pulsar_namespace"}
-	}
+	metricsLevelLabels := func() []string {
+		switch metricsCardinality {
+		case 1: //MetricsCardinalityNone
+			return []string{}
+		case 2: //MetricsCardinalityTenant
+			return []string{"pulsar_tenant"}
+		case 3: //MetricsCardinalityNamespace
+			return []string{"pulsar_tenant", "pulsar_namespace"}
+		case 4: //MetricsCardinalityTopic
+			return []string{"pulsar_tenant", "pulsar_namespace", "topic"}
+		default: //Anything else is namespace
+			return []string{"pulsar_tenant", "pulsar_namespace"}
+		}
+	}()
 
 	metrics := &Metrics{
 		metricsLevel: metricsCardinality,
@@ -193,6 +192,12 @@ func NewMetricsProvider(metricsCardinality int, userDefinedLabels map[string]str
 			ConstLabels: constLabels,
 			Buckets:     []float64{.0005, .001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
 		}, metricsLevelLabels),
+
+		SendingBuffersCount: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "pulsar_client_sending_buffers_count",
+			Help:        "Number of sending buffers",
+			ConstLabels: constLabels,
+		}),
 
 		producersOpened: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        "pulsar_client_producers_opened",
@@ -584,6 +589,7 @@ func NewMetricsProvider(metricsCardinality int, userDefinedLabels map[string]str
 			metrics.RPCRequestCount = are.ExistingCollector.(prometheus.Counter)
 		}
 	}
+	_ = registerer.Register(metrics.SendingBuffersCount)
 	return metrics
 }
 

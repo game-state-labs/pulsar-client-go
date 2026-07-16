@@ -22,7 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -33,6 +35,7 @@ import (
 	"time"
 
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/admin"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -227,6 +230,223 @@ func TestConsumerWithInvalidConf(t *testing.T) {
 	assert.Equal(t, err.(*Error).Result(), TopicNotFound)
 }
 
+func TestConsumerWithInvalidPriorityLevel(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            "my-topic",
+		SubscriptionName: "my-sub",
+		PriorityLevel:    -1,
+	})
+
+	assert.Nil(t, consumer)
+	assert.NotNil(t, err)
+	assert.Equal(t, err.(*Error).Result(), InvalidConfiguration)
+}
+
+func TestPriorityConsumer(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	sub := "sub-shared-priority"
+
+	// High-priority consumers (priority 1)
+	consumer1, err := client.Subscribe(ConsumerOptions{
+		Topic:             topic,
+		SubscriptionName:  sub,
+		Type:              Shared,
+		ReceiverQueueSize: 5,
+		PriorityLevel:     1,
+	})
+	assert.Nil(t, err)
+	defer consumer1.Close()
+
+	consumer2, err := client.Subscribe(ConsumerOptions{
+		Topic:             topic,
+		SubscriptionName:  sub,
+		Type:              Shared,
+		ReceiverQueueSize: 5,
+		PriorityLevel:     1,
+	})
+	assert.Nil(t, err)
+	defer consumer2.Close()
+
+	// Low-priority consumer (priority 2)
+	consumer3, err := client.Subscribe(ConsumerOptions{
+		Topic:             topic,
+		SubscriptionName:  sub,
+		Type:              Shared,
+		ReceiverQueueSize: 5,
+		PriorityLevel:     2,
+	})
+	assert.Nil(t, err)
+	defer consumer3.Close()
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: true,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	// Phase 1: Send 15 messages — distributed among the three priority-1 consumers
+	for i := 0; i < 15; i++ {
+		_, err := producer.Send(context.Background(), &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+		})
+		assert.Nil(t, err)
+	}
+
+	// Phase 2: Drain 20 messages from consumer1 and consumer2 to replenish their permits.
+	// After receiving, each consumer sends individual permits back to the broker,
+	// so consumer1 and consumer2 will have more permits than consumer3.
+	for i := 0; i < 20; i++ {
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = consumer1.Receive(ctx1)
+		cancel1()
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = consumer2.Receive(ctx2)
+		cancel2()
+	}
+
+	// Phase 3: Send 5 more messages — broker should dispatch only to consumer1/consumer2
+	// because they have more available permits at priority level 1.
+	for i := 0; i < 5; i++ {
+		_, err := producer.Send(context.Background(), &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-extra-%d", i)),
+		})
+		assert.Nil(t, err)
+	}
+
+	// Low-priority consumer should not have received any messages
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	msg, err := consumer3.Receive(ctx)
+	cancel()
+	assert.NotNil(t, err)
+	assert.Nil(t, msg)
+}
+
+func TestFailOverConsumerPriority(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	randomName := newTopicName()
+	topic := "persistent://public/default/" + randomName
+	testURL := adminURL + "/" + "admin/v2/persistent/public/default/" + randomName + "/partitions"
+	makeHTTPCall(t, http.MethodPut, testURL, "9")
+
+	sub := "my-sub"
+
+	// C1 at priority 1
+	consumer1, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		Name:             "aaa",
+		SubscriptionName: sub,
+		Type:             Failover,
+		PriorityLevel:    1,
+	})
+	assert.Nil(t, err)
+	defer consumer1.Close()
+
+	// C2 at priority 0 — should take over from C1
+	consumer2, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		Name:             "bbb1",
+		SubscriptionName: sub,
+		Type:             Failover,
+		PriorityLevel:    0,
+	})
+	assert.Nil(t, err)
+	defer consumer2.Close()
+
+	// C3 at priority 0
+	consumer3, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		Name:             "bbb2",
+		SubscriptionName: sub,
+		Type:             Failover,
+		PriorityLevel:    0,
+	})
+	assert.Nil(t, err)
+	defer consumer3.Close()
+
+	// C4 at priority 0
+	consumer4, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		Name:             "bbb3",
+		SubscriptionName: sub,
+		Type:             Failover,
+		PriorityLevel:    0,
+	})
+	assert.Nil(t, err)
+	defer consumer4.Close()
+
+	// C5 at priority 1 — should not get any partitions
+	consumer5, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		Name:             "bbb4",
+		SubscriptionName: sub,
+		Type:             Failover,
+		PriorityLevel:    1,
+	})
+	assert.Nil(t, err)
+	defer consumer5.Close()
+
+	evenDistribution := 9 / 3 // 3 partitions per priority-0 consumer
+
+	topicName, err := utils.GetTopicName(topic)
+	assert.Nil(t, err)
+
+	cfg := &config.Config{}
+	pulsarAdmin, err := pulsaradmin.NewClient(cfg)
+	assert.NoError(t, err)
+
+	// Poll admin stats until partitions are evenly distributed among priority-0 consumers
+	retryAssert(t, 20, 500, func() {}, func(_ assert.TestingT) bool {
+		stats, err := pulsarAdmin.Topics().GetPartitionedStats(*topicName, true)
+		if err != nil {
+			return false
+		}
+		counts := map[string]int{}
+		for _, pStats := range stats.Partitions {
+			subStats, ok := pStats.Subscriptions[sub]
+			if !ok {
+				return false
+			}
+			counts[subStats.ActiveConsumerName]++
+		}
+		return len(counts) == 3 &&
+			counts["bbb1"] == evenDistribution &&
+			counts["bbb2"] == evenDistribution &&
+			counts["bbb3"] == evenDistribution
+	})
+
+	// Final assertion with real test failure
+	stats, err := pulsarAdmin.Topics().GetPartitionedStats(*topicName, true)
+	assert.Nil(t, err)
+	counts := map[string]int{}
+	for _, pStats := range stats.Partitions {
+		subStats := pStats.Subscriptions[sub]
+		counts[subStats.ActiveConsumerName]++
+	}
+	assert.Equal(t, 3, len(counts))
+	assert.Equal(t, evenDistribution, counts["bbb1"])
+	assert.Equal(t, evenDistribution, counts["bbb2"])
+	assert.Equal(t, evenDistribution, counts["bbb3"])
+}
+
 func TestConsumerSubscriptionEarliestPosition(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		URL: lookupURL,
@@ -336,9 +556,91 @@ func TestConsumerKeyShared(t *testing.T) {
 	assert.NotEqual(t, 0, receivedConsumer1)
 	assert.NotEqual(t, 0, receivedConsumer2)
 
-	t.Logf("TestConsumerKeyShared received messages consumer1: %d consumser2: %d\n",
+	t.Logf("TestConsumerKeyShared received messages consumer1: %d consumer2: %d\n",
 		receivedConsumer1, receivedConsumer2)
 	assert.Equal(t, 100, receivedConsumer1+receivedConsumer2)
+}
+
+// TestConsumerKeySharedWithDelayedMessages
+// test using delayed messages and key-shared sub mode at the same time
+func TestConsumerKeySharedWithDelayedMessages(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+	topic := newTopicName()
+
+	consumer1, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		SubscriptionName: "sub-1",
+		Type:             KeyShared,
+	})
+	assert.Nil(t, err)
+	defer consumer1.Close()
+	consumer2, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		SubscriptionName: "sub-1",
+		Type:             KeyShared,
+	})
+	assert.Nil(t, err)
+	defer consumer2.Close()
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic: topic,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+	ctx := context.Background()
+	startTime := time.Now()
+	delayTime := 3 * time.Second
+	for i := 0; i < 100; i++ {
+		_, err := producer.Send(ctx, &ProducerMessage{
+			Key:          fmt.Sprintf("key-shared-%d", i%3),
+			Payload:      []byte(fmt.Sprintf("value-%d", i)),
+			DeliverAfter: delayTime,
+		})
+		assert.Nil(t, err)
+	}
+
+	receivedConsumer1 := 0
+	receivedConsumer2 := 0
+	timeoutTimer := time.After(2 * delayTime)
+	for (receivedConsumer1 + receivedConsumer2) < 100 {
+		select {
+		case <-timeoutTimer:
+			break
+		default:
+		}
+
+		select {
+		case cm, ok := <-consumer1.Chan():
+			if !ok {
+				break
+			}
+			receivedConsumer1++
+			_ = consumer1.Ack(cm.Message)
+			assert.GreaterOrEqual(t, time.Since(startTime), delayTime,
+				"TestConsumerKeySharedWithDelayedMessages should delay messages later than defined deliverAfter time",
+			)
+		case cm, ok := <-consumer2.Chan():
+			if !ok {
+				break
+			}
+			receivedConsumer2++
+			_ = consumer2.Ack(cm.Message)
+			assert.GreaterOrEqual(t, time.Since(startTime), delayTime,
+				"TestConsumerKeySharedWithDelayedMessages should delay messages later than defined deliverAfter time",
+			)
+		}
+	}
+
+	assert.NotEqual(t, 0, receivedConsumer1)
+	assert.NotEqual(t, 0, receivedConsumer2)
+	assert.Equal(t, 100, receivedConsumer1+receivedConsumer2)
+	t.Logf("TestConsumerKeySharedWithDelayedMessages received messages consumer1: %d consumer2: %d, timecost: %d\n",
+		receivedConsumer1, receivedConsumer2, time.Since(startTime).Milliseconds(),
+	)
 }
 
 func TestPartitionTopicsConsumerPubSub(t *testing.T) {
@@ -1142,6 +1444,102 @@ func TestConsumerNack(t *testing.T) {
 	}
 }
 
+func TestNegativeAckPrecisionBitCnt(t *testing.T) {
+	// Validate behavior across precision bits and default (nil -> 8)
+	const delay = 300 * time.Millisecond // Tracker scans every 100ms (delay/3)
+	ctx := context.Background()
+
+	client, err := NewClient(ClientOptions{URL: lookupURL})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	// Helper to verify behavior for a given NackPrecisionBit and boundary bits.
+	testPrecisionBitBehavior := func(nackPrecisionBit *int64, boundaryBits int64) {
+		// Create topic, consumer and producer inside the function
+		topicName := fmt.Sprintf("testNackPrecisionBit-%d-%d", boundaryBits, time.Now().UnixNano())
+		consumer, err := client.Subscribe(ConsumerOptions{
+			Topic:               topicName,
+			SubscriptionName:    fmt.Sprintf("sub-%d", boundaryBits),
+			Type:                Shared,
+			NackRedeliveryDelay: delay,
+			NackPrecisionBit:    nackPrecisionBit, // can be nil for default behavior
+		})
+		assert.Nil(t, err)
+		defer consumer.Close()
+
+		producer, err := client.CreateProducer(ProducerOptions{Topic: topicName})
+		assert.Nil(t, err)
+		defer producer.Close()
+
+		// Align to the next window boundary based on boundaryBits
+		windowMs := int64(1) << boundaryBits
+		nowMs := time.Now().UnixMilli()
+		nextBoundaryMs := ((nowMs / windowMs) + 1) * windowMs // Next boundary
+		time.Sleep(time.Duration(nextBoundaryMs-nowMs) * time.Millisecond)
+
+		// Send first message at the boundary
+		content1 := fmt.Sprintf("msg1-p%d", boundaryBits)
+		_, err = producer.Send(ctx, &ProducerMessage{Payload: []byte(content1)})
+		assert.Nil(t, err)
+
+		// Send second message around 3/4 into the window (still in same window)
+		time.Sleep(time.Duration(windowMs*3/4) * time.Millisecond)
+		content2 := fmt.Sprintf("msg2-p%d", boundaryBits)
+		_, err = producer.Send(ctx, &ProducerMessage{Payload: []byte(content2)})
+		assert.Nil(t, err)
+
+		// Receive and nack both messages
+		m1, err := consumer.Receive(ctx)
+		assert.Nil(t, err)
+		assert.Equal(t, content1, string(m1.Payload()))
+		consumer.Nack(m1)
+		m2, err := consumer.Receive(ctx)
+		assert.Nil(t, err)
+		assert.Equal(t, content2, string(m2.Payload()))
+		consumer.Nack(m2)
+
+		// Expected redelivery window considering precision and tracker tick
+		expected := time.Now().Add(delay)
+		deviation := time.Duration(windowMs) * time.Millisecond
+
+		// Both should be redelivered in the same cycle
+		rm1, err := consumer.Receive(ctx)
+		assert.Nil(t, err)
+		redeliveryTime1 := time.Now()
+		rm2, err := consumer.Receive(ctx)
+		assert.Nil(t, err)
+		redeliveryTime2 := time.Now()
+
+		// For both the default precision (nil) and precisionBit=8, boundaryBits is 8.
+		// This checks that the default precisionBit is correctly set to 8,
+		// and that its redelivery behavior matches a consumer explicitly configured with precisionBit=8.
+		if boundaryBits == 8 {
+			assert.InDelta(t, redeliveryTime1.UnixMilli(), redeliveryTime2.UnixMilli(), 1)
+		}
+
+		// Redelivery should occur within [expected-window, expected+buffer]
+		minExpected := expected.Add(-deviation)
+		maxExpected := expected.Add(150 * time.Millisecond)
+		assert.GreaterOrEqual(t, redeliveryTime1.UnixMilli(), minExpected.UnixMilli())
+		assert.LessOrEqual(t, redeliveryTime2.UnixMilli(), maxExpected.UnixMilli())
+
+		consumer.Ack(rm1)
+		consumer.Ack(rm2)
+	}
+
+	// Run for precision bits 1...8 with matching boundary bits
+	for bits := int64(1); bits <= int64(8); bits++ {
+		t.Run(fmt.Sprintf("PrecisionBits=%d", bits), func(_ *testing.T) {
+			testPrecisionBitBehavior(ptr(bits), bits)
+		})
+	}
+
+	// Default behavior (nil) should match precision bit 8
+	t.Run("DefaultPrecisionBits=8", func(_ *testing.T) {
+		testPrecisionBitBehavior(nil, int64(8))
+	})
+}
+
 func TestConsumerCompression(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		URL: lookupURL,
@@ -1207,6 +1605,98 @@ func TestConsumerCompression(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Equal(t, fmt.Sprintf("msg-content-%d-batching-disabled", i), string(msg.Payload()))
 		consumer.Ack(msg)
+	}
+}
+
+func TestConsumerMultiCompressions(t *testing.T) {
+	type testProvider struct {
+		name            string
+		compressionType CompressionType
+	}
+
+	providers := []testProvider{
+		{"zlib", ZLib},
+		{"lz4", LZ4},
+		{"zstd", ZSTD},
+		{"snappy", SNAPPY},
+	}
+
+	for _, provider := range providers {
+		p := provider
+		t.Run(p.name, func(t *testing.T) {
+			client, err := NewClient(ClientOptions{
+				URL: lookupURL,
+			})
+
+			assert.Nil(t, err)
+			defer client.Close()
+
+			batchTopic, nonBatchTopic := newTopicName(), newTopicName()
+			ctx := context.Background()
+
+			// enable batching
+			batchProducer, err := client.CreateProducer(ProducerOptions{
+				Topic:           batchTopic,
+				CompressionType: p.compressionType,
+				DisableBatching: false,
+			})
+			assert.Nil(t, err)
+			defer batchProducer.Close()
+
+			batchConsumer, err := client.Subscribe(ConsumerOptions{
+				Topic:            batchTopic,
+				SubscriptionName: "sub-1",
+			})
+			assert.Nil(t, err)
+			defer batchConsumer.Close()
+
+			const N = 100
+			for i := 0; i < N; i++ {
+				batchProducer.SendAsync(ctx, &ProducerMessage{
+					Payload: []byte(fmt.Sprintf("msg-content-%d-batching-enabled", i)),
+				}, func(_ MessageID, _ *ProducerMessage, err error) {
+					assert.Nil(t, err)
+				})
+			}
+
+			for i := 0; i < N; i++ {
+				msg, err := batchConsumer.Receive(ctx)
+				assert.Nil(t, err)
+				assert.Equal(t, fmt.Sprintf("msg-content-%d-batching-enabled", i), string(msg.Payload()))
+				batchConsumer.Ack(msg)
+			}
+
+			// disable batching
+			nonBatchProducer, err := client.CreateProducer(ProducerOptions{
+				Topic:           nonBatchTopic,
+				CompressionType: p.compressionType,
+				DisableBatching: true,
+			})
+			assert.Nil(t, err)
+			defer nonBatchProducer.Close()
+
+			nonBatchConsumer, err := client.Subscribe(ConsumerOptions{
+				Topic:            nonBatchTopic,
+				SubscriptionName: "sub-1",
+			})
+			assert.Nil(t, err)
+			defer nonBatchConsumer.Close()
+
+			for i := 0; i < N; i++ {
+				if _, err := nonBatchProducer.Send(ctx, &ProducerMessage{
+					Payload: []byte(fmt.Sprintf("msg-content-%d-batching-disabled", i)),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			for i := 0; i < N; i++ {
+				msg, err := nonBatchConsumer.Receive(ctx)
+				assert.Nil(t, err)
+				assert.Equal(t, fmt.Sprintf("msg-content-%d-batching-disabled", i), string(msg.Payload()))
+				nonBatchConsumer.Ack(msg)
+			}
+		})
 	}
 }
 
@@ -1497,12 +1987,26 @@ func DLQWithProducerOptions(t *testing.T, prodOpt *ProducerOptions) {
 	defer producer.Close()
 
 	// send 10 messages
+	eventTimeList := make([]time.Time, 10)
+	msgIDList := make([]string, 10)
+	msgKeyList := make([]string, 10)
 	for i := 0; i < 10; i++ {
-		if _, err := producer.Send(ctx, &ProducerMessage{
-			Payload: []byte(fmt.Sprintf("hello-%d", i)),
-		}); err != nil {
+		eventTime := time.Now()
+		eventTimeList[i] = eventTime
+		msgKeyList[i] = fmt.Sprintf("key-%d", i)
+		msgID, err := producer.Send(ctx, &ProducerMessage{
+			Payload:     []byte(fmt.Sprintf("hello-%d", i)),
+			Key:         fmt.Sprintf("key-%d", i),
+			OrderingKey: fmt.Sprintf("key-%d", i),
+			EventTime:   eventTime,
+			Properties: map[string]string{
+				"key": fmt.Sprintf("key-%d", i),
+			},
+		})
+		if err != nil {
 			log.Fatal(err)
 		}
+		msgIDList[i] = msgID.String()
 	}
 
 	// receive 10 messages and only ack half-of-them
@@ -1541,10 +2045,27 @@ func DLQWithProducerOptions(t *testing.T, prodOpt *ProducerOptions) {
 		assert.True(t, regex.MatchString(msg.ProducerName()))
 
 		// check original messageId
+		assert.NotEmpty(t, msg.Properties()[SysPropertyOriginMessageID])
+		assert.Equal(t, msgIDList[expectedMsgIdx], msg.Properties()[SysPropertyOriginMessageID])
 		assert.NotEmpty(t, msg.Properties()[PropertyOriginMessageID])
+		assert.Equal(t, msgIDList[expectedMsgIdx], msg.Properties()[PropertyOriginMessageID])
 
 		// check original topic
-		assert.NotEmpty(t, msg.Properties()[SysPropertyRealTopic])
+		assert.Contains(t, msg.Properties()[SysPropertyRealTopic], topic)
+
+		// check original key
+		assert.NotEmpty(t, msg.Key())
+		assert.Equal(t, msgKeyList[expectedMsgIdx], msg.Key())
+		assert.NotEmpty(t, msg.OrderingKey())
+		assert.Equal(t, msgKeyList[expectedMsgIdx], msg.OrderingKey())
+		assert.NotEmpty(t, msg.Properties()["key"])
+		assert.Equal(t, msg.Key(), msg.Properties()["key"])
+
+		//	check original event time
+		//	Broker will ignore event time microsecond(us) level precision,
+		//	so that we need to check eventTime precision in millisecond level
+		assert.NotEqual(t, 0, msg.EventTime())
+		assert.True(t, eventTimeList[expectedMsgIdx].Sub(msg.EventTime()).Abs() < 2*time.Millisecond)
 	}
 
 	// No more messages on the DLQ
@@ -1645,6 +2166,180 @@ func TestDeadLetterTopicWithInitialSubscription(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, msg)
 
+}
+
+func TestWithoutDeadLetterTopicDeadLetterTopicProducerName(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := "persistent://public/default/" + newTopicName()
+	subscriptionName := "default"
+	consumerName := "my-consumer"
+
+	dlqTopic := fmt.Sprintf("%s-%s-DLQ", topic, subscriptionName)
+	rlqTopic := fmt.Sprintf("%s-%s-RLQ", topic, subscriptionName)
+
+	producerName := "producer-name"
+	RLQProducerName := "rlq-producer-name"
+	DLQProducerName := "dlq-producer-name"
+
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:               topic,
+		SubscriptionName:    subscriptionName,
+		NackRedeliveryDelay: 1 * time.Millisecond,
+		Type:                Shared,
+		DLQ: &DLQPolicy{
+			MaxDeliveries:               1,
+			RetryLetterTopic:            rlqTopic,
+			DeadLetterTopic:             dlqTopic,
+			DeadLetterTopicProducerName: DLQProducerName,
+			ProducerOptions: ProducerOptions{
+				Topic: rlqTopic,
+				Name:  RLQProducerName,
+			},
+		},
+		Name:        consumerName,
+		RetryEnable: true,
+	})
+	assert.Nil(t, err)
+	defer consumer.Close()
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic: topic,
+		Name:  producerName,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	_, err = producer.Send(ctx, &ProducerMessage{
+		Payload: []byte("hello-0"),
+	})
+	assert.Nil(t, err)
+
+	// Validate the name of the original producer
+	msg, err := consumer.Receive(ctx)
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	assert.Equal(t, msg.ProducerName(), producerName)
+	consumer.ReconsumeLater(msg, 0)
+
+	// Validate the name of the RLQ producer
+	msg, err = consumer.Receive(ctx)
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	assert.Equal(t, msg.ProducerName(), RLQProducerName)
+	consumer.Nack(msg)
+
+	// Create DLQ consumer
+	dlqConsumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            dlqTopic,
+		SubscriptionName: subscriptionName,
+	})
+	assert.Nil(t, err)
+	defer dlqConsumer.Close()
+
+	// Validate the name of the DLQ producer
+	msg, err = dlqConsumer.Receive(ctx)
+	defer dlqConsumer.Nack(msg)
+
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	assert.Nil(t, err)
+	assert.Equal(t, msg.ProducerName(), DLQProducerName)
+}
+
+func TestWithDeadLetterTopicDeadLetterTopicProducerName(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := "persistent://public/default/" + newTopicName()
+	subscriptionName := "default"
+	consumerName := "my-consumer"
+
+	dlqTopic := fmt.Sprintf("%s-%s-DLQ", topic, subscriptionName)
+	rlqTopic := fmt.Sprintf("%s-%s-RLQ", topic, subscriptionName)
+
+	producerName := "producer-name"
+	RLQProducerName := "rlq-producer-name"
+
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:               topic,
+		SubscriptionName:    subscriptionName,
+		NackRedeliveryDelay: 1 * time.Millisecond,
+		Type:                Shared,
+		DLQ: &DLQPolicy{
+			MaxDeliveries:    1,
+			RetryLetterTopic: rlqTopic,
+			DeadLetterTopic:  dlqTopic,
+			// Set no producer name for the DLQ explicitly
+			DeadLetterTopicProducerName: "",
+			ProducerOptions: ProducerOptions{
+				Topic: rlqTopic,
+				Name:  RLQProducerName,
+			},
+		},
+		Name:        consumerName,
+		RetryEnable: true,
+	})
+	assert.Nil(t, err)
+	defer consumer.Close()
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic: topic,
+		Name:  producerName,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	_, err = producer.Send(ctx, &ProducerMessage{
+		Payload: []byte("hello-0"),
+	})
+	assert.Nil(t, err)
+
+	// Validate the name of the original producer
+	msg, err := consumer.Receive(ctx)
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	assert.Equal(t, msg.ProducerName(), producerName)
+	consumer.ReconsumeLater(msg, 0)
+
+	// Validate the name of the RLQ producer
+	msg, err = consumer.Receive(ctx)
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	assert.Equal(t, msg.ProducerName(), RLQProducerName)
+	consumer.Nack(msg)
+
+	// Create DLQ consumer
+	dlqConsumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            dlqTopic,
+		SubscriptionName: subscriptionName,
+	})
+	assert.Nil(t, err)
+	defer dlqConsumer.Close()
+
+	// Validate the name of the DLQ producer
+	msg, err = dlqConsumer.Receive(ctx)
+	defer dlqConsumer.Nack(msg)
+
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	regex := regexp.MustCompile(fmt.Sprintf("%s-%s-%s-[a-z]{5}-DLQ", topic, subscriptionName, consumerName))
+	assert.True(t, regex.MatchString(msg.ProducerName()))
 }
 
 func TestDLQMultiTopics(t *testing.T) {
@@ -1759,6 +2454,7 @@ func TestRLQ(t *testing.T) {
 	makeHTTPCall(t, http.MethodPut, testURL, "3")
 
 	subName := fmt.Sprintf("sub01-%d", time.Now().Unix())
+	consumerName := "my-consumer"
 	maxRedeliveries := 2
 	N := 100
 	ctx := context.Background()
@@ -1772,15 +2468,31 @@ func TestRLQ(t *testing.T) {
 	assert.Nil(t, err)
 	defer producer.Close()
 
+	eventTimeList := make([]time.Time, N)
+	msgIDList := make([]string, N)
+	msgKeyList := make([]string, N)
 	for i := 0; i < N; i++ {
-		_, err = producer.Send(ctx, &ProducerMessage{Payload: []byte(fmt.Sprintf("MESSAGE_%d", i))})
+		eventTime := time.Now()
+		eventTimeList[i] = eventTime
+		msgKeyList[i] = fmt.Sprintf("key-%d", i)
+		msgID, err := producer.Send(ctx, &ProducerMessage{
+			Payload:     []byte(fmt.Sprintf("MESSAGE_%d", i)),
+			Key:         fmt.Sprintf("key-%d", i),
+			OrderingKey: fmt.Sprintf("key-%d", i),
+			EventTime:   eventTime,
+			Properties: map[string]string{
+				"key": fmt.Sprintf("key-%d", i),
+			},
+		})
 		assert.Nil(t, err)
+		msgIDList[i] = msgID.String()
 	}
 
 	// 2. Create consumer on the Retry Topic to reconsume N messages (maxRedeliveries+1) times
 	rlqConsumer, err := client.Subscribe(ConsumerOptions{
 		Topic:                       topic,
 		SubscriptionName:            subName,
+		Name:                        consumerName,
 		Type:                        Shared,
 		SubscriptionInitialPosition: SubscriptionPositionEarliest,
 		DLQ: &DLQPolicy{
@@ -1820,6 +2532,37 @@ func TestRLQ(t *testing.T) {
 	dlqReceived := 0
 	for dlqReceived < N {
 		msg, err := dlqConsumer.Receive(ctx)
+		//	check original messageId
+		//	we create a topic with three partitions,
+		//	so that messages maybe not be received as the same order as we produced
+		assert.NotEmpty(t, msg.Properties()[SysPropertyOriginMessageID])
+		assert.Contains(t, msgIDList, msg.Properties()[SysPropertyOriginMessageID])
+		assert.NotEmpty(t, msg.Properties()[PropertyOriginMessageID])
+		assert.Contains(t, msgIDList, msg.Properties()[PropertyOriginMessageID])
+
+		// check original topic
+		assert.Contains(t, msg.Properties()[SysPropertyRealTopic], topic)
+
+		// check original key
+		assert.NotEmpty(t, msg.Key())
+		assert.Contains(t, msgKeyList, msg.Key())
+		assert.NotEmpty(t, msg.OrderingKey())
+		assert.Contains(t, msgKeyList, msg.OrderingKey())
+		assert.NotEmpty(t, msg.Properties()["key"])
+		assert.Equal(t, msg.Key(), msg.Properties()["key"])
+
+		// check original event time
+		assert.NotEqual(t, 0, msg.EventTime())
+		//	check original event time
+		//	Broker will ignore event time microsecond(us) level precision,
+		//	so that we need to check eventTime precision in millisecond level
+		assert.LessOrEqual(t, eventTimeList[0].Add(-2*time.Millisecond), msg.EventTime())
+		assert.LessOrEqual(t, msg.EventTime(), eventTimeList[N-1].Add(2*time.Millisecond))
+
+		// check dlq produceName
+		regex := regexp.MustCompile(fmt.Sprintf("%s-%s-%s-[a-z]{5}-DLQ", topic, subName, consumerName))
+		assert.True(t, regex.MatchString(msg.ProducerName()))
+
 		assert.Nil(t, err)
 		dlqConsumer.Ack(msg)
 		dlqReceived++
@@ -1964,6 +2707,75 @@ func TestRLQWithCustomProperties(t *testing.T) {
 	assert.Nil(t, checkMsg)
 }
 
+// Test function to test Retry Logic with Custom Properties and Event Time
+func TestRLQWithCustomPropertiesEventTime(t *testing.T) {
+	topic := newTopicName()
+	testURL := adminURL + "/" + "admin/v2/persistent/public/default/" + topic + "/partitions"
+	makeHTTPCall(t, http.MethodPut, testURL, "3")
+
+	subName := fmt.Sprintf("sub01-%d", time.Now().Unix())
+	maxRedeliveries := 2
+	ctx := context.Background()
+
+	client, err := NewClient(ClientOptions{URL: lookupURL})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	// 1. Create producer and send a message with custom event time
+	producer, err := client.CreateProducer(ProducerOptions{Topic: topic})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	expectedEventTime := timeFromUnixTimestampMillis(uint64(1565161612000)) // Custom event time
+	_, err = producer.Send(ctx, &ProducerMessage{
+		Payload:   []byte("MESSAGE_WITH_EVENT_TIME"),
+		EventTime: expectedEventTime,
+	})
+	assert.Nil(t, err)
+
+	// 2. Create consumer on the Retry Topic
+	rlqConsumer, err := client.Subscribe(ConsumerOptions{
+		Topic:                       topic,
+		SubscriptionName:            subName,
+		Type:                        Shared,
+		SubscriptionInitialPosition: SubscriptionPositionEarliest,
+		DLQ: &DLQPolicy{
+			MaxDeliveries: uint32(maxRedeliveries),
+		},
+		RetryEnable:         true,
+		NackRedeliveryDelay: 1 * time.Second,
+	})
+	assert.Nil(t, err)
+	defer rlqConsumer.Close()
+
+	// 3. Receive the original message and verify event time
+	msg, err := rlqConsumer.Receive(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, expectedEventTime.Unix(), msg.EventTime().Unix(),
+		"Original message should have the expected event time")
+
+	// 4. ReconsumeLater with custom properties and verify event time is preserved
+	customProps := map[string]string{
+		"custom-key-1": "custom-value-1",
+	}
+	rlqConsumer.ReconsumeLaterWithCustomProperties(msg, customProps, 1*time.Second)
+
+	// 5. Receive the reconsumed message and verify event time is preserved
+	retryMsg, err := rlqConsumer.Receive(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, expectedEventTime.Unix(), retryMsg.EventTime().Unix(),
+		"Reconsumed message should preserve the original event time")
+
+	// 6. Verify custom properties are also preserved
+	msgProps := retryMsg.Properties()
+	value, ok := msgProps["custom-key-1"]
+	assert.True(t, ok, "Custom property should be present")
+	assert.Equal(t, "custom-value-1", value, "Custom property value should match")
+
+	// 7. Clean up - ack the message to avoid further redeliveries
+	rlqConsumer.Ack(retryMsg)
+}
+
 func TestAckWithResponse(t *testing.T) {
 	now := time.Now().Unix()
 	topic01 := fmt.Sprintf("persistent://public/default/topic-%d-01", now)
@@ -2043,6 +2855,7 @@ func TestRLQMultiTopics(t *testing.T) {
 	topics := []string{topic01, topic02}
 
 	subName := fmt.Sprintf("sub01-%d", time.Now().Unix())
+	consumerName := "my-consumer"
 	maxRedeliveries := 2
 	N := 100
 	ctx := context.Background()
@@ -2055,6 +2868,7 @@ func TestRLQMultiTopics(t *testing.T) {
 	rlqConsumer, err := client.Subscribe(ConsumerOptions{
 		Topics:                      topics,
 		SubscriptionName:            subName,
+		Name:                        consumerName,
 		Type:                        Shared,
 		SubscriptionInitialPosition: SubscriptionPositionEarliest,
 		DLQ:                         &DLQPolicy{MaxDeliveries: uint32(maxRedeliveries)},
@@ -2109,9 +2923,12 @@ func TestRLQMultiTopics(t *testing.T) {
 
 	// 3. Create consumer on the DLQ topic to verify the routing
 	dlqReceived := 0
+	// check dlq produceName
+	regex := regexp.MustCompile(fmt.Sprintf("%s-%s-%s-[a-z]{5}-DLQ", "", subName, consumerName))
 	for dlqReceived < 2*N {
 		msg, err := dlqConsumer.Receive(ctx)
 		assert.Nil(t, err)
+		assert.True(t, regex.MatchString(msg.ProducerName()))
 		dlqConsumer.Ack(msg)
 		dlqReceived++
 	}
@@ -2704,11 +3521,11 @@ func TestKeyBasedBatchProducerConsumerKeyShared(t *testing.T) {
 	assert.Equal(t, len(consumer1Keys)*MsgBatchCount, receivedConsumer1)
 	assert.Equal(t, len(consumer2Keys)*MsgBatchCount, receivedConsumer2)
 
-	t.Logf("TestKeyBasedBatchProducerConsumerKeyShared received messages consumer1: %d consumser2: %d\n",
+	t.Logf("TestKeyBasedBatchProducerConsumerKeyShared received messages consumer1: %d consumer2: %d\n",
 		receivedConsumer1, receivedConsumer2)
 	assert.Equal(t, 300, receivedConsumer1+receivedConsumer2)
 
-	t.Logf("TestKeyBasedBatchProducerConsumerKeyShared received messages keys consumer1: %v consumser2: %v\n",
+	t.Logf("TestKeyBasedBatchProducerConsumerKeyShared received messages keys consumer1: %v consumer2: %v\n",
 		consumer1Keys, consumer2Keys)
 }
 
@@ -2887,7 +3704,7 @@ func TestConsumerKeySharedWithOrderingKey(t *testing.T) {
 	assert.NotEqual(t, 0, receivedConsumer2)
 
 	t.Logf(
-		"TestConsumerKeySharedWithOrderingKey received messages consumer1: %d consumser2: %d\n",
+		"TestConsumerKeySharedWithOrderingKey received messages consumer1: %d consumer2: %d\n",
 		receivedConsumer1, receivedConsumer2,
 	)
 	assert.Equal(t, 100, receivedConsumer1+receivedConsumer2)
@@ -3908,7 +4725,7 @@ func TestConsumerWithBackoffPolicy(t *testing.T) {
 	assert.Nil(t, err)
 	defer _consumer.Close()
 
-	partitionConsumerImp := _consumer.(*consumer).consumers[0]
+	partitionConsumerImp := _consumer.(*consumer).partitionConsumers()[0]
 	// 1 s
 	startTime := time.Now()
 	partitionConsumerImp.reconnectToBroker(nil)
@@ -3979,7 +4796,7 @@ func TestBatchIndexAck(t *testing.T) {
 		cumulative         bool
 		ackGroupingOptions *AckGroupingOptions
 	}
-	configs := make([]config, 0)
+	configs := make([]config, 0, 12)
 	for _, option := range []*AckGroupingOptions{
 		nil, // MaxSize: 1000, MaxTime: 10ms
 		{MaxSize: 0, MaxTime: 0},
@@ -4131,7 +4948,7 @@ func TestConsumerWithAutoScaledQueueReceive(t *testing.T) {
 		EnableAutoScaledReceiverQueueSize: true,
 	})
 	assert.Nil(t, err)
-	pc := c.(*consumer).consumers[0]
+	pc := c.(*consumer).partitionConsumers()[0]
 	assert.Equal(t, int32(1), pc.currentQueueSize.Load())
 	defer c.Close()
 
@@ -4346,7 +5163,7 @@ func TestConsumerMemoryLimit(t *testing.T) {
 	})
 	assert.Nil(t, err)
 	defer c1.Close()
-	pc1 := c1.(*consumer).consumers[0]
+	pc1 := c1.(*consumer).partitionConsumers()[0]
 
 	// Fill up the messageCh of c1
 	for i := 0; i < 10; i++ {
@@ -4386,7 +5203,7 @@ func TestConsumerMemoryLimit(t *testing.T) {
 	})
 	assert.Nil(t, err)
 	defer c2.Close()
-	pc2 := c2.(*consumer).consumers[0]
+	pc2 := c2.(*consumer).partitionConsumers()[0]
 
 	// Try to induce c2 receiver queue size expansion
 	for i := 0; i < 10; i++ {
@@ -4458,7 +5275,7 @@ func TestMultiConsumerMemoryLimit(t *testing.T) {
 	})
 	assert.Nil(t, err)
 	defer c1.Close()
-	pc1 := c1.(*consumer).consumers[0]
+	pc1 := c1.(*consumer).partitionConsumers()[0]
 
 	// Use mem-limited client 2 to create consumer c1
 	c2, err := cli2.Subscribe(ConsumerOptions{
@@ -4469,7 +5286,7 @@ func TestMultiConsumerMemoryLimit(t *testing.T) {
 	})
 	assert.Nil(t, err)
 	defer c2.Close()
-	pc2 := c2.(*consumer).consumers[0]
+	pc2 := c2.(*consumer).partitionConsumers()[0]
 
 	// Fill up the messageCh of c1 nad c2
 	for i := 0; i < 10; i++ {
@@ -4774,8 +5591,30 @@ func TestAckIDList(t *testing.T) {
 	}
 }
 
+func getAckCount(registry *prometheus.Registry) (int, error) {
+	metrics, err := registry.Gather()
+	if err != nil {
+		return 0, err
+	}
+
+	var ackCount float64
+	for _, metric := range metrics {
+		if metric.GetName() == "pulsar_client_consumer_acks" {
+			for _, m := range metric.GetMetric() {
+				ackCount += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return int(ackCount), nil
+}
+
 func runAckIDListTest(t *testing.T, enableBatchIndexAck bool) {
-	client, err := NewClient(ClientOptions{URL: lookupURL})
+	// Create a custom metrics registry
+	registry := prometheus.NewRegistry()
+	client, err := NewClient(ClientOptions{
+		URL:               lookupURL,
+		MetricsRegisterer: registry,
+	})
 	assert.Nil(t, err)
 	defer client.Close()
 
@@ -4804,6 +5643,10 @@ func runAckIDListTest(t *testing.T, enableBatchIndexAck bool) {
 		msgIDs[i] = msgs[ackedIndexes[i]].ID()
 	}
 	assert.Nil(t, consumer.AckIDList(msgIDs))
+	ackCnt, err := getAckCount(registry)
+	expectedAckCnt := len(msgIDs)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedAckCnt, ackCnt)
 	consumer.Close()
 
 	consumer = createSharedConsumer(t, client, topic, enableBatchIndexAck)
@@ -4818,6 +5661,10 @@ func runAckIDListTest(t *testing.T, enableBatchIndexAck bool) {
 			msgIDs = append(msgIDs, originalMsgIDs[i])
 		}
 		assert.Nil(t, consumer.AckIDList(msgIDs))
+		expectedAckCnt = expectedAckCnt + len(msgIDs)
+		ackCnt, err = getAckCount(registry)
+		assert.NoError(t, err)
+		assert.Equal(t, expectedAckCnt, ackCnt)
 		consumer.Close()
 
 		consumer = createSharedConsumer(t, client, topic, enableBatchIndexAck)
@@ -4838,6 +5685,10 @@ func runAckIDListTest(t *testing.T, enableBatchIndexAck bool) {
 	} else {
 		assert.Fail(t, "AckIDList should return AckError")
 	}
+
+	ackCnt, err = getAckCount(registry)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedAckCnt, ackCnt) // The Ack Counter shouldn't be increased.
 }
 
 func createSharedConsumer(t *testing.T, client Client, topic string, enableBatchIndexAck bool) Consumer {
@@ -4879,7 +5730,7 @@ func sendMessages(t *testing.T, client Client, topic string, startIndex int, num
 			}
 		}
 	}
-	assert.Nil(t, producer.Flush())
+	assert.Nil(t, producer.FlushWithCtx(ctx))
 }
 
 func receiveMessages(t *testing.T, consumer Consumer, numMessages int) []Message {
@@ -4925,10 +5776,10 @@ func TestAckResponseNotBlocked(t *testing.T) {
 			}
 		})
 		if i%100 == 99 {
-			assert.Nil(t, producer.Flush())
+			assert.Nil(t, producer.FlushWithCtx(ctx))
 		}
 	}
-	producer.Flush()
+	producer.FlushWithCtx(ctx)
 	producer.Close()
 
 	// Set a small receiver queue size to trigger ack response blocking if the internal `queueCh`
@@ -4966,7 +5817,7 @@ func TestConsumerKeepReconnectingAndThenCallClose(t *testing.T) {
 		Image:        getPulsarTestImage(),
 		ExposedPorts: []string{"6650/tcp", "8080/tcp"},
 		WaitingFor:   wait.ForExposedPort(),
-		Cmd:          []string{"bin/pulsar", "standalone", "-nfw"},
+		Cmd:          []string{"bin/pulsar", "standalone", "-nfw", "--advertised-address", "localhost"},
 	}
 	c, err := testcontainers.GenericContainer(context.Background(), testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -5027,7 +5878,8 @@ func TestClientVersion(t *testing.T) {
 	topicState, err := admin.Topics().GetStats(*topicName)
 	assert.Nil(t, err)
 	publisher := topicState.Publishers[0]
-	assert.True(t, strings.HasPrefix(publisher.ClientVersion, "Pulsar Go version"))
+	assert.True(t, strings.HasPrefix(publisher.ClientVersion, "Pulsar-Go-version"))
+	assert.NotContains(t, publisher.ClientVersion, " ")
 
 	topic = newTopicName()
 	client, err = NewClient(ClientOptions{
@@ -5045,9 +5897,9 @@ func TestClientVersion(t *testing.T) {
 	topicState, err = admin.Topics().GetStats(*topicName)
 	assert.Nil(t, err)
 	publisher = topicState.Publishers[0]
-	assert.True(t, strings.HasPrefix(publisher.ClientVersion, "Pulsar Go version"))
+	assert.True(t, strings.HasPrefix(publisher.ClientVersion, "Pulsar-Go-version"))
 	assert.True(t, strings.HasSuffix(publisher.ClientVersion, "-test-client"))
-
+	assert.NotContains(t, publisher.ClientVersion, " ")
 }
 
 func TestSelectConnectionForSameConsumer(t *testing.T) {
@@ -5068,12 +5920,591 @@ func TestSelectConnectionForSameConsumer(t *testing.T) {
 	assert.NoError(t, err)
 	defer _consumer.Close()
 
-	partitionConsumerImpl := _consumer.(*consumer).consumers[0]
+	partitionConsumerImpl := _consumer.(*consumer).partitionConsumers()[0]
 	conn := partitionConsumerImpl._getConn()
 
 	for i := 0; i < 5; i++ {
 		assert.NoError(t, partitionConsumerImpl.grabConn(""))
 		assert.Equal(t, conn.ID(), partitionConsumerImpl._getConn().ID(),
 			"The consumer uses a different connection when reconnecting")
+	}
+}
+
+func TestInternalTopicSubscribeToPartitionsDoesNotBlockExistingPartitionLookup(t *testing.T) {
+	lookupURL, err := url.Parse("pulsar://localhost:6650")
+	require.NoError(t, err)
+
+	allowSubscribe := make(chan struct{})
+	subscribeStarted := make(chan struct{})
+	var releaseSubscribe sync.Once
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := plog.NewLoggerWithSlog(logger)
+
+	rpcClient := &blockingSubscribeRPCClient{
+		lookupResult:     &internal.LookupResult{LogicalAddr: lookupURL, PhysicalAddr: lookupURL},
+		subscribeStarted: subscribeStarted,
+		allowSubscribe:   allowSubscribe,
+		subscribeErr:     errors.New("stop subscribe after lookup check"),
+		nextConsumerID:   1,
+	}
+
+	c := newInternalTopicPartitionTestConsumer(internalTopicPartitionTestConsumerOptions{
+		conn:             dummyConnection{},
+		rpcClient:        rpcClient,
+		partitions:       2,
+		log:              log,
+		consumerOptions:  ConsumerOptions{SubscriptionName: "test-sub", NackPrecisionBit: ptr(defaultNackPrecisionBit)},
+		initialConsumers: []*partitionConsumer{{topic: "persistent://public/default/test-topic-partition-0"}},
+	})
+
+	go func() {
+		c.internalTopicSubscribeToPartitions()
+	}()
+
+	select {
+	case <-subscribeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for partition discovery to start subscribing the new partition")
+	}
+
+	lookupErrCh := make(chan error, 1)
+	go func() {
+		_, err := findPartitionConsumer(c.partitionConsumers(), &messageID{partitionIdx: 0})
+		lookupErrCh <- err
+	}()
+
+	select {
+	case err := <-lookupErrCh:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		releaseSubscribe.Do(func() { close(allowSubscribe) })
+		select {
+		case <-lookupErrCh:
+		case <-time.After(time.Second):
+			t.Fatal("existing partition lookup stayed blocked even after partition discovery stopped")
+		}
+		t.Fatal("existing partition lookup blocked while a new partition was being added")
+	}
+
+	releaseSubscribe.Do(func() { close(allowSubscribe) })
+}
+
+func TestInternalTopicSubscribeToPartitionsPublishesConsumersBeforeDispatchingMessages(t *testing.T) {
+	lookupURL, err := url.Parse("pulsar://localhost:6650")
+	require.NoError(t, err)
+
+	partitionOneSubscribed := make(chan struct{})
+	partitionOneFlowed := make(chan struct{})
+	partitionTwoBlocked := make(chan struct{})
+	allowPartitionTwo := make(chan struct{})
+	cnx := newPartitionExpansionRaceConnection()
+	rpcClient := &partitionExpansionRaceRPCClient{
+		lookupResult:           &internal.LookupResult{LogicalAddr: lookupURL, PhysicalAddr: lookupURL},
+		cnx:                    cnx,
+		partitionOneSubscribed: partitionOneSubscribed,
+		partitionOneFlowed:     partitionOneFlowed,
+		partitionTwoBlocked:    partitionTwoBlocked,
+		allowPartitionTwo:      allowPartitionTwo,
+	}
+
+	c := newInternalTopicPartitionTestConsumer(internalTopicPartitionTestConsumerOptions{
+		conn:       cnx,
+		rpcClient:  rpcClient,
+		partitions: 3,
+		log:        plog.DefaultNopLogger(),
+		consumerOptions: ConsumerOptions{
+			SubscriptionName:  "test-sub",
+			ReceiverQueueSize: 1,
+			NackPrecisionBit:  ptr(defaultNackPrecisionBit),
+			AckWithResponse:   true,
+		},
+		initialConsumers: []*partitionConsumer{{topic: "persistent://public/default/test-topic-partition-0"}},
+		dlq:              &dlqRouter{},
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.internalTopicSubscribeToPartitions()
+	}()
+
+	select {
+	case <-partitionOneSubscribed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for partition 1 to subscribe")
+	}
+
+	select {
+	case <-partitionTwoBlocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for partition 2 subscribe to block")
+	}
+
+	require.Len(t, c.partitionConsumers(), 1)
+	select {
+	case <-partitionOneFlowed:
+		t.Fatal("new partition dispatcher requested permits before c.consumers contained the new partition")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(allowPartitionTwo)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for partition discovery to finish")
+	}
+	require.Len(t, c.partitionConsumers(), 3)
+
+	select {
+	case <-partitionOneFlowed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for partition 1 dispatcher to request permits")
+	}
+
+	handler := cnx.handler(rpcClient.partitionOneConsumerID.Load())
+	require.NotNil(t, handler)
+	err = handler.MessageReceived(&pb.CommandMessage{
+		MessageId: &pb.MessageIdData{
+			LedgerId: proto.Uint64(1),
+			EntryId:  proto.Uint64(1),
+		},
+	}, internal.NewBufferWrapper(rawCompatSingleMessage))
+	require.NoError(t, err)
+
+	var cm ConsumerMessage
+	select {
+	case cm = <-c.messageCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the queued partition 1 message to dispatch")
+	}
+	require.Equal(t, int32(1), cm.Message.ID().PartitionIdx())
+	require.NoError(t, c.AckID(cm.Message.ID()))
+
+	for _, pc := range c.partitionConsumers()[1:] {
+		pc.Close()
+	}
+}
+
+type internalTopicPartitionTestConsumerOptions struct {
+	conn             internal.Connection
+	rpcClient        internal.RPCClient
+	partitions       int
+	log              plog.Logger
+	consumerOptions  ConsumerOptions
+	initialConsumers []*partitionConsumer
+	dlq              *dlqRouter
+}
+
+func newInternalTopicPartitionTestConsumer(opts internalTopicPartitionTestConsumerOptions) *consumer {
+	var consumers atomic.Value
+	consumers.Store(append([]*partitionConsumer(nil), opts.initialConsumers...))
+
+	return &consumer{
+		topic: "persistent://public/default/test-topic",
+		client: &client{
+			cnxPool:       &blockingConnPool{cnx: opts.conn},
+			rpcClient:     opts.rpcClient,
+			lookupService: &partitionMetadataLookup{partitions: opts.partitions},
+			log:           opts.log,
+		},
+		options:      opts.consumerOptions,
+		consumers:    consumers,
+		messageCh:    make(chan ConsumerMessage, 1),
+		closeCh:      make(chan struct{}),
+		errorCh:      make(chan error, 1),
+		consumerName: "test-consumer",
+		dlq:          opts.dlq,
+		log:          opts.log,
+		metrics:      newTestMetrics(),
+	}
+}
+
+type partitionMetadataLookup struct {
+	internal.LookupService
+	partitions int
+}
+
+func (l *partitionMetadataLookup) GetPartitionedTopicMetadata(_ string) (*internal.PartitionedTopicMetadata, error) {
+	return &internal.PartitionedTopicMetadata{Partitions: l.partitions}, nil
+}
+
+type blockingConnPool struct {
+	internal.ConnectionPool
+	cnx internal.Connection
+}
+
+func (p *blockingConnPool) GetConnection(_ *url.URL, _ *url.URL, _ int32) (internal.Connection, error) {
+	return p.cnx, nil
+}
+
+func (p *blockingConnPool) GetConnections() map[string]internal.Connection {
+	return map[string]internal.Connection{}
+}
+
+func (p *blockingConnPool) GenerateRoundRobinIndex() int32 {
+	return 0
+}
+
+func (p *blockingConnPool) Close() {}
+
+type partitionExpansionRaceConnection struct {
+	dummyConnection
+	mu       sync.Mutex
+	handlers map[uint64]internal.ConsumerHandler
+}
+
+func newPartitionExpansionRaceConnection() *partitionExpansionRaceConnection {
+	return &partitionExpansionRaceConnection{handlers: make(map[uint64]internal.ConsumerHandler)}
+}
+
+func (c *partitionExpansionRaceConnection) AddConsumeHandler(id uint64, handler internal.ConsumerHandler) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.handlers[id] = handler
+	return nil
+}
+
+func (c *partitionExpansionRaceConnection) DeleteConsumeHandler(id uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.handlers, id)
+}
+
+func (c *partitionExpansionRaceConnection) handler(id uint64) internal.ConsumerHandler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.handlers[id]
+}
+
+type partitionExpansionRaceRPCClient struct {
+	internal.RPCClient
+	lookupResult           *internal.LookupResult
+	cnx                    *partitionExpansionRaceConnection
+	partitionOneSubscribed chan struct{}
+	partitionOneFlowed     chan struct{}
+	partitionTwoBlocked    chan struct{}
+	allowPartitionTwo      chan struct{}
+	requestID              atomic.Uint64
+	consumerID             atomic.Uint64
+	partitionOneConsumerID atomic.Uint64
+	partitionOneOnce       sync.Once
+	partitionOneFlowOnce   sync.Once
+	partitionTwoOnce       sync.Once
+}
+
+func (r *partitionExpansionRaceRPCClient) NewRequestID() uint64 {
+	return r.requestID.Add(1)
+}
+
+func (r *partitionExpansionRaceRPCClient) NewProducerID() uint64 {
+	return r.requestID.Add(1)
+}
+
+func (r *partitionExpansionRaceRPCClient) NewConsumerID() uint64 {
+	return r.consumerID.Add(1)
+}
+
+func (r *partitionExpansionRaceRPCClient) RequestOnCnxNoWait(
+	_ internal.Connection, cmdType pb.BaseCommand_Type, msg proto.Message,
+) error {
+	if cmdType == pb.BaseCommand_FLOW {
+		flow := msg.(*pb.CommandFlow)
+		if flow.GetConsumerId() == r.partitionOneConsumerID.Load() {
+			r.partitionOneFlowOnce.Do(func() { close(r.partitionOneFlowed) })
+		}
+	}
+	return nil
+}
+
+func (r *partitionExpansionRaceRPCClient) RequestOnCnx(
+	_ internal.Connection, _ uint64, cmdType pb.BaseCommand_Type, msg proto.Message,
+) (*internal.RPCResult, error) {
+	switch cmdType {
+	case pb.BaseCommand_SUBSCRIBE:
+		return r.handleSubscribe(msg.(*pb.CommandSubscribe))
+	case pb.BaseCommand_ACK, pb.BaseCommand_CLOSE_CONSUMER:
+		return r.success(), nil
+	default:
+		return nil, fmt.Errorf("unexpected command type %v", cmdType)
+	}
+}
+
+func (r *partitionExpansionRaceRPCClient) handleSubscribe(cmd *pb.CommandSubscribe) (*internal.RPCResult, error) {
+	switch {
+	case strings.HasSuffix(cmd.GetTopic(), "-partition-1"):
+		r.partitionOneConsumerID.Store(cmd.GetConsumerId())
+		r.partitionOneOnce.Do(func() { close(r.partitionOneSubscribed) })
+		return r.success(), nil
+	case strings.HasSuffix(cmd.GetTopic(), "-partition-2"):
+		r.partitionTwoOnce.Do(func() { close(r.partitionTwoBlocked) })
+		<-r.allowPartitionTwo
+		return r.success(), nil
+	default:
+		return nil, fmt.Errorf("unexpected subscribe topic %s", cmd.GetTopic())
+	}
+}
+
+func (r *partitionExpansionRaceRPCClient) success() *internal.RPCResult {
+	successType := pb.BaseCommand_SUCCESS
+	return &internal.RPCResult{
+		Response: &pb.BaseCommand{Type: &successType},
+		Cnx:      r.cnx,
+	}
+}
+
+func (r *partitionExpansionRaceRPCClient) LookupService(_ string) (internal.LookupService, error) {
+	return &grabConnMockLookup{result: r.lookupResult}, nil
+}
+
+type blockingSubscribeRPCClient struct {
+	internal.RPCClient
+	lookupResult     *internal.LookupResult
+	subscribeStarted chan struct{}
+	allowSubscribe   chan struct{}
+	subscribeErr     error
+	nextConsumerID   uint64
+	startOnce        sync.Once
+}
+
+func (r *blockingSubscribeRPCClient) NewRequestID() uint64 {
+	return 1
+}
+
+func (r *blockingSubscribeRPCClient) NewProducerID() uint64 {
+	return 1
+}
+
+func (r *blockingSubscribeRPCClient) NewConsumerID() uint64 {
+	id := r.nextConsumerID
+	r.nextConsumerID++
+	return id
+}
+
+func (r *blockingSubscribeRPCClient) RequestOnCnxNoWait(
+	_ internal.Connection, _ pb.BaseCommand_Type, _ proto.Message) error {
+	return nil
+}
+
+func (r *blockingSubscribeRPCClient) RequestOnCnx(
+	_ internal.Connection, _ uint64, cmdType pb.BaseCommand_Type, _ proto.Message,
+) (*internal.RPCResult, error) {
+	switch cmdType {
+	case pb.BaseCommand_SUBSCRIBE:
+		r.startOnce.Do(func() { close(r.subscribeStarted) })
+		<-r.allowSubscribe
+		return nil, r.subscribeErr
+	case pb.BaseCommand_CLOSE_CONSUMER:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unexpected command type %v", cmdType)
+	}
+}
+
+func (r *blockingSubscribeRPCClient) LookupService(_ string) (internal.LookupService, error) {
+	return &grabConnMockLookup{result: r.lookupResult}, nil
+}
+
+// closeInterceptor captures the (consumer, err) pair delivered to
+// ConsumerCloseInterceptor.OnConsumerClose and signals via fired.
+type closeInterceptor struct {
+	fired    chan struct{}
+	consumer Consumer
+	err      error
+	once     sync.Once
+}
+
+func (c *closeInterceptor) BeforeConsume(_ ConsumerMessage)              {}
+func (c *closeInterceptor) OnAcknowledge(_ Consumer, _ MessageID)        {}
+func (c *closeInterceptor) OnNegativeAcksSend(_ Consumer, _ []MessageID) {}
+func (c *closeInterceptor) OnConsumerClose(consumer Consumer, err error) {
+	c.once.Do(func() {
+		c.consumer = consumer
+		c.err = err
+		close(c.fired)
+	})
+}
+
+func TestConsumerOnCloseInterceptorOnMaxReconnect(t *testing.T) {
+	req := testcontainers.ContainerRequest{
+		Image:        getPulsarTestImage(),
+		ExposedPorts: []string{"6650/tcp", "8080/tcp"},
+		WaitingFor:   wait.ForExposedPort(),
+		Cmd:          []string{"bin/pulsar", "standalone", "-nfw", "--advertised-address", "localhost"},
+	}
+	c, err := testcontainers.GenericContainer(context.Background(), testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := c.Terminate(context.Background()); err != nil {
+			t.Logf("container terminate (cleanup) returned: %v", err)
+		}
+	})
+	endpoint, err := c.PortEndpoint(context.Background(), "6650", "pulsar")
+	require.NoError(t, err)
+
+	pulsarClient, err := NewClient(ClientOptions{
+		URL:               endpoint,
+		ConnectionTimeout: 3 * time.Second,
+		OperationTimeout:  5 * time.Second,
+	})
+	require.NoError(t, err)
+	defer pulsarClient.Close()
+
+	maxRetry := uint(1)
+	interceptor := &closeInterceptor{fired: make(chan struct{})}
+
+	topic := newTopicName()
+	var testConsumer Consumer
+	require.Eventually(t, func() bool {
+		testConsumer, err = pulsarClient.Subscribe(ConsumerOptions{
+			Topic:                topic,
+			SubscriptionName:     "test-on-close-interceptor",
+			MaxReconnectToBroker: &maxRetry,
+			BackOffPolicyFunc: func() backoff.Policy {
+				return newTestBackoffPolicy(100*time.Millisecond, 1*time.Second)
+			},
+			Interceptors: ConsumerInterceptors{interceptor},
+		})
+		return err == nil
+	}, 30*time.Second, 1*time.Second)
+	defer testConsumer.Close()
+
+	require.NoError(t, c.Terminate(context.Background()))
+
+	select {
+	case <-interceptor.fired:
+	case <-time.After(30 * time.Second):
+		t.Fatal("OnConsumerClose was not called within timeout")
+	}
+
+	assert.NotNil(t, interceptor.err, "interceptor should receive the cause of the close")
+	assert.Equal(t, testConsumer, interceptor.consumer, "interceptor should receive the parent consumer")
+
+	pc := testConsumer.(*consumer).partitionConsumers()[0]
+	require.Eventually(t, func() bool {
+		return pc.getConsumerState() == consumerClosed
+	}, 30*time.Second, 100*time.Millisecond, "consumer should be closed after exhausting max reconnect retries")
+}
+
+func TestConsumerOnCloseInterceptorOnUserClose(t *testing.T) {
+	client, err := NewClient(ClientOptions{URL: serviceURL})
+	require.NoError(t, err)
+	defer client.Close()
+
+	interceptor := &closeInterceptor{fired: make(chan struct{})}
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            newTopicName(),
+		SubscriptionName: "test-on-close-user",
+		Interceptors:     ConsumerInterceptors{interceptor},
+	})
+	require.NoError(t, err)
+
+	consumer.Close()
+
+	select {
+	case <-interceptor.fired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnConsumerClose was not called within timeout")
+	}
+
+	assert.Nil(t, interceptor.err, "user-initiated close should report nil cause")
+	assert.Equal(t, consumer, interceptor.consumer)
+}
+
+func TestIsNonRetriableSubscribeError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"topic not found", errors.New("TopicNotFound: topic does not exist"), true},
+		{"topic terminated", errors.New("TopicTerminatedError: topic was terminated"), true},
+		{"subscription not found", errors.New("SubscriptionNotFound: sub does not exist"), true},
+		{"authorization", errors.New("AuthorizationError: not authorized"), true},
+		{"consumer busy", errors.New("ConsumerBusy: another consumer attached"), true},
+		{"invalid topic name", errors.New("InvalidTopicName: bad name"), true},
+		{"incompatible schema", errors.New("IncompatibleSchema: schema mismatch"), true},
+		{"consumer assign error", errors.New("ConsumerAssignError: dispatcher assign failed"), true},
+		{"not allowed", errors.New("NotAllowedError: action not permitted"), true},
+		{"service not ready (retriable)", errors.New("ServiceNotReady: please retry"), false},
+		{"metadata error (retriable)", errors.New("MetadataError: zk timeout"), false},
+		{"plain network error (retriable)", errors.New("dial tcp: i/o timeout"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isNonRetriableSubscribeError(tc.err))
+		})
+	}
+}
+
+// lookupServiceWrapper embeds the original LookupService and only overrides
+// GetPartitionedTopicMetadata to record the topics that were queried.
+type lookupServiceWrapper struct {
+	internal.LookupService
+	mu           sync.Mutex
+	calledTopics []string
+}
+
+func (w *lookupServiceWrapper) GetPartitionedTopicMetadata(topic string) (*internal.PartitionedTopicMetadata, error) {
+	w.mu.Lock()
+	w.calledTopics = append(w.calledTopics, topic)
+	w.mu.Unlock()
+	return &internal.PartitionedTopicMetadata{Partitions: 0}, nil
+}
+
+// TestConsumerWithDLQRetryTopicNoGetPartitionedTopicMetadata verifies that when custom DLQ and Retry
+// topics are provided in DLQPolicy, the resolveTopic function should NOT call GetPartitionedTopicMetadata
+// to check old-format DLQ/Retry topics. This ensures the optimization path works correctly.
+func TestConsumerWithDLQRetryTopicNoGetPartitionedTopicMetadata(t *testing.T) {
+	// Create a real client with a short operation timeout so that the subsequent
+	// consumer creation (which requires a broker connection) fails quickly.
+	c, err := NewClient(ClientOptions{
+		URL:                     serviceURL,
+		MaxConnectionsPerBroker: 10,
+		OperationTimeout:        1 * time.Second,
+	})
+	assert.NoError(t, err)
+	defer c.Close()
+
+	// Replace the client's internal lookupService with our wrapper to intercept
+	// and record all GetPartitionedTopicMetadata calls.
+	realClient := c.(*client)
+	wrapper := &lookupServiceWrapper{LookupService: realClient.lookupService}
+	realClient.lookupService = wrapper
+
+	// Subscribe with custom DLQ and Retry topics specified.
+	// The Subscribe call will fail due to no broker connection, but the
+	// resolveTopic logic executes before the connection attempt.
+	_, _ = c.Subscribe(ConsumerOptions{
+		Topic:            "persistent://public/default/test-topic",
+		SubscriptionName: "test-subscription",
+		RetryEnable:      true,
+		DLQ: &DLQPolicy{
+			MaxDeliveries:    3,
+			DeadLetterTopic:  "persistent://public/default/my-dlq-topic",
+			RetryLetterTopic: "persistent://public/default/my-retry-topic",
+		},
+	})
+
+	// These are the old-format topics that resolveTopic would check via
+	// GetPartitionedTopicMetadata if no custom topics were provided.
+	oldDlqTopic := "persistent://public/default/test-subscription" + DlqTopicSuffix
+	oldRetryTopic := "persistent://public/default/test-subscription" + RetryTopicSuffix
+
+	// Verify that GetPartitionedTopicMetadata was never called with old-format topics.
+	// When custom DLQ/Retry topics are provided, resolveTopic should return them directly
+	// without checking whether old-format topics exist.
+	wrapper.mu.Lock()
+	defer wrapper.mu.Unlock()
+	for _, topic := range wrapper.calledTopics {
+		assert.NotEqual(t, oldDlqTopic, topic,
+			"GetPartitionedTopicMetadata should not be called with old DLQ topic when custom DLQ topic is provided")
+		assert.NotEqual(t, oldRetryTopic, topic,
+			"GetPartitionedTopicMetadata should not be called with old Retry topic when custom Retry topic is provided")
 	}
 }

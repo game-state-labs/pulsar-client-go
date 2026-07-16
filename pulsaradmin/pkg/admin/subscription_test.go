@@ -20,6 +20,7 @@ package admin
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -63,24 +64,28 @@ func TestGetMessagesByID(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(numberMessages)
-	messageIDMap := make(map[string]int32)
+	// Group by ledger:entry (ignoring batchIdx) to count batch sizes
+	type ledgerEntry struct {
+		LedgerID int64
+		EntryID  int64
+	}
+	messageIDMap := make(map[ledgerEntry]int32)
 	for i := 0; i <= numberMessages; i++ {
 		producer.SendAsync(ctx, &pulsar.ProducerMessage{
 			Payload: []byte(fmt.Sprintf("hello-%d", i)),
 		}, func(id pulsar.MessageID, _ *pulsar.ProducerMessage, err error) {
 			assert.Nil(t, err)
-			messageIDMap[id.String()]++
+			key := ledgerEntry{LedgerID: id.LedgerID(), EntryID: id.EntryID()}
+			messageIDMap[key]++
 			wg.Done()
 		})
 	}
 	wg.Wait()
 	topicName, err := utils.GetTopicName(topic)
 	assert.NoError(t, err)
-	for id, i := range messageIDMap {
+	for key, i := range messageIDMap {
 		assert.Equal(t, i, int32(batchingMaxMessages))
-		messageID, err := utils.ParseMessageID(id)
-		assert.Nil(t, err)
-		messages, err := admin.Subscriptions().GetMessagesByID(*topicName, messageID.LedgerID, messageID.EntryID)
+		messages, err := admin.Subscriptions().GetMessagesByID(*topicName, key.LedgerID, key.EntryID)
 		assert.Nil(t, err)
 		assert.Equal(t, batchingMaxMessages, len(messages))
 	}
@@ -126,7 +131,7 @@ func TestPeekMessageForPartitionedTopic(t *testing.T) {
 			Payload: []byte(fmt.Sprintf("hello-%d", i)),
 		}, nil)
 	}
-	err = producer.Flush()
+	err = producer.FlushWithCtx(ctx)
 	if err != nil {
 		return
 	}
@@ -144,58 +149,108 @@ func TestPeekMessageForPartitionedTopic(t *testing.T) {
 	}
 }
 
-func TestPeekMessageWithProperties(t *testing.T) {
-	randomName := newTopicName()
-	topic := "persistent://public/default/" + randomName
-	topicName, _ := utils.GetTopicName(topic)
-	subName := "test-sub"
-
-	cfg := &config.Config{}
-	admin, err := New(cfg)
-	assert.NoError(t, err)
-	assert.NotNil(t, admin)
-
-	client, err := pulsar.NewClient(pulsar.ClientOptions{
-		URL: lookupURL,
-	})
-	assert.NoError(t, err)
-	defer client.Close()
-
-	// Create a producer for non-batch messages
-	producer, err := client.CreateProducer(pulsar.ProducerOptions{
-		Topic:           topic,
-		DisableBatching: true,
-	})
-	assert.NoError(t, err)
-	defer producer.Close()
-
-	props := map[string]string{
-		"key1":        "value1",
-		"KEY2":        "VALUE2",
-		"KeY3":        "VaLuE3",
-		"details=man": "good at playing basketball",
+func TestPeekMessagesWithProperties(t *testing.T) {
+	tests := map[string]struct {
+		batched bool
+	}{
+		"non-batched": {
+			batched: false,
+		},
+		"batched": {
+			batched: true,
+		},
 	}
 
-	_, err = producer.Send(context.Background(), &pulsar.ProducerMessage{
-		Payload:    []byte("test-message"),
-		Properties: props,
-	})
-	assert.NoError(t, err)
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			randomName := newTopicName()
+			topic := "persistent://public/default/" + randomName
+			topicName, _ := utils.GetTopicName(topic)
+			subName := "test-sub"
 
-	// Peek messages
-	messages, err := admin.Subscriptions().PeekMessages(*topicName, subName, 1)
-	assert.NoError(t, err)
-	assert.NotNil(t, messages)
+			cfg := &config.Config{}
+			admin, err := New(cfg)
+			assert.NoError(t, err)
+			assert.NotNil(t, admin)
 
-	// Verify properties of messages
-	for _, msg := range messages {
-		assert.Equal(t, "value1", msg.Properties["key1"])
-		assert.Equal(t, "VALUE2", msg.Properties["KEY2"])
-		assert.Equal(t, "VaLuE3", msg.Properties["KeY3"])
-		assert.Equal(t, "good at playing basketball", msg.Properties["details=man"])
+			client, err := pulsar.NewClient(pulsar.ClientOptions{
+				URL: lookupURL,
+			})
+			assert.NoError(t, err)
+			defer client.Close()
+
+			var producer pulsar.Producer
+			batchSize := 5
+			if tc.batched {
+				producer, err = client.CreateProducer(pulsar.ProducerOptions{
+					Topic:                   topic,
+					DisableBatching:         false,
+					BatchingMaxMessages:     uint(batchSize),
+					BatchingMaxPublishDelay: time.Second * 2,
+				})
+				assert.NoError(t, err)
+				defer producer.Close()
+			} else {
+				producer, err = client.CreateProducer(pulsar.ProducerOptions{
+					Topic:           topic,
+					DisableBatching: true,
+				})
+				assert.NoError(t, err)
+				defer producer.Close()
+			}
+
+			props := map[string]string{
+				"key1":        "value1",
+				"KEY2":        "VALUE2",
+				"KeY3":        "VaLuE3",
+				"details=man": "good at playing basketball",
+			}
+
+			var wg sync.WaitGroup
+			numberOfMessagesToWaitFor := 10
+			numberOfMessagesToSend := numberOfMessagesToWaitFor
+			if tc.batched {
+				// If batched send one extra message to cause the batch to be sent immediately
+				numberOfMessagesToSend++
+			}
+			wg.Add(numberOfMessagesToWaitFor)
+
+			for i := 0; i < numberOfMessagesToSend; i++ {
+				producer.SendAsync(ctx, &pulsar.ProducerMessage{
+					Payload:    []byte("test-message"),
+					Properties: props,
+				}, func(_ pulsar.MessageID, _ *pulsar.ProducerMessage, err error) {
+					assert.Nil(t, err)
+					if i < numberOfMessagesToWaitFor {
+						wg.Done()
+					}
+				})
+			}
+			wg.Wait()
+
+			// Peek messages
+			messages, err := admin.Subscriptions().PeekMessages(*topicName, subName, batchSize)
+			assert.NoError(t, err)
+			assert.NotNil(t, messages)
+			assert.Len(t, messages, batchSize)
+
+			// Verify properties of messages
+			for _, msg := range messages {
+				assert.Equal(t, "value1", msg.Properties["key1"])
+				assert.Equal(t, "VALUE2", msg.Properties["KEY2"])
+				assert.Equal(t, "VaLuE3", msg.Properties["KeY3"])
+				assert.Equal(t, "good at playing basketball", msg.Properties["details=man"])
+				// Standard pulsar properties, set by pulsar
+				assert.NotEmpty(t, msg.Properties["publish-time"])
+				if tc.batched {
+					assert.NotEmpty(t, msg.Properties[BatchHeader])
+					assert.Equal(t, strconv.Itoa(batchSize), msg.Properties[BatchHeader])
+				}
+			}
+		})
 	}
 }
-
 func TestGetMessageByID(t *testing.T) {
 	randomName := newTopicName()
 	topic := "persistent://public/default/" + randomName

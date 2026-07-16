@@ -18,10 +18,13 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/admin/auth"
@@ -29,7 +32,14 @@ import (
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/rest"
 	"github.com/apache/pulsar-client-go/pulsaradmin/pkg/utils"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestBrokerHealthCheckWithTopicVersion(t *testing.T) {
 	readFile, err := os.ReadFile("../../../integration-tests/tokens/admin-token")
@@ -97,6 +107,84 @@ func TestUpdateDynamicConfiguration(t *testing.T) {
 	assert.NotEmpty(t, configurations)
 }
 
+func TestUpdateDynamicConfigurationEscapedValueE2E(t *testing.T) {
+	readFile, err := os.ReadFile("../../../integration-tests/tokens/admin-token")
+	require.NoError(t, err)
+	cfg := &config.Config{
+		Token: string(readFile),
+	}
+	admin, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+	t.Cleanup(func() {
+		assert.NoError(t, admin.Brokers().DeleteDynamicConfiguration("loadBalancerSheddingExcludedNamespaces"))
+	})
+
+	err = admin.Brokers().UpdateDynamicConfiguration("loadBalancerSheddingExcludedNamespaces", "my-tenant/my-namespace")
+	require.NoError(t, err)
+
+	configurations, err := admin.Brokers().GetAllDynamicConfigurations()
+	require.NoError(t, err)
+	require.NotEmpty(t, configurations)
+	assert.Equal(t, "my-tenant/my-namespace", configurations["loadBalancerSheddingExcludedNamespaces"])
+}
+
+func TestUpdateDynamicConfigurationEscapesConfigValue(t *testing.T) {
+	admin := &pulsarClient{
+		APIVersion: config.V2,
+		Client: &rest.Client{
+			ServiceURL: "http://example.com",
+			HTTPClient: &http.Client{
+				Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					require.Equal(t, http.MethodPost, r.Method)
+					require.Equal(
+						t,
+						"/admin/v2/brokers/configuration/loadBalancerSheddingExcludedNamespaces/my-tenant%2Fmy-namespace",
+						r.URL.EscapedPath(),
+					)
+					return &http.Response{
+						StatusCode: http.StatusNoContent,
+						Body:       io.NopCloser(strings.NewReader("")),
+						Header:     make(http.Header),
+						Request:    r,
+					}, nil
+				}),
+			},
+		},
+	}
+
+	err := admin.Brokers().UpdateDynamicConfiguration("loadBalancerSheddingExcludedNamespaces", "my-tenant/my-namespace")
+	require.NoError(t, err)
+}
+
+func TestUpdateDynamicConfigurationDoesNotCleanConfigPath(t *testing.T) {
+	admin := &pulsarClient{
+		APIVersion: config.V2,
+		Client: &rest.Client{
+			ServiceURL: "http://example.com",
+			HTTPClient: &http.Client{
+				Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					require.Equal(t, http.MethodPost, r.Method)
+					require.Equal(
+						t,
+						"/admin/v2/brokers/configuration/loadBalancerSheddingExcludedNamespaces/..",
+						r.URL.EscapedPath(),
+					)
+					return &http.Response{
+						StatusCode: http.StatusNoContent,
+						Body:       io.NopCloser(strings.NewReader("")),
+						Header:     make(http.Header),
+						Request:    r,
+					}, nil
+				}),
+			},
+		},
+	}
+
+	err := admin.Brokers().UpdateDynamicConfiguration("loadBalancerSheddingExcludedNamespaces", "..")
+	require.NoError(t, err)
+}
+
 func TestUpdateDynamicConfigurationWithCustomURL(t *testing.T) {
 	readFile, err := os.ReadFile("../../../integration-tests/tokens/admin-token")
 	assert.NoError(t, err)
@@ -123,7 +211,7 @@ func TestUpdateDynamicConfigurationWithCustomURL(t *testing.T) {
 	value := `{"key/123":"https://example.com/"}`
 	encoded := url.QueryEscape(value)
 
-	resp, err := client.MakeRequestWithURL(http.MethodPost, &url.URL{
+	resp, err := client.MakeRequestWithURLWithContext(context.Background(), http.MethodPost, &url.URL{
 		Scheme: u.Scheme,
 		User:   u.User,
 		Host:   u.Host,

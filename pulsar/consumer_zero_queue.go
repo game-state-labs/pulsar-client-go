@@ -23,6 +23,8 @@ import (
 	"sync"
 	"time"
 
+	uAtomic "go.uber.org/atomic"
+
 	"github.com/apache/pulsar-client-go/pulsar/internal"
 	"github.com/apache/pulsar-client-go/pulsar/log"
 	"github.com/pkg/errors"
@@ -36,6 +38,7 @@ type zeroQueueConsumer struct {
 	pc                        *partitionConsumer
 	consumerName              string
 	disableForceTopicCreation bool
+	waitingOnReceive          uAtomic.Bool
 
 	messageCh chan ConsumerMessage
 
@@ -66,12 +69,22 @@ func newZeroConsumer(client *client, options ConsumerOptions, topic string,
 		consumerName:              options.Name,
 		metrics:                   client.metrics.GetLeveledMetrics(topic),
 	}
-	opts := newPartitionConsumerOpts(zc.topic, zc.consumerName, 0, zc.options)
-	conn, err := newPartitionConsumer(zc, zc.client, opts, zc.messageCh, zc.dlq, zc.metrics)
+	tn, err := internal.ParseTopicName(topic)
 	if err != nil {
 		return nil, err
 	}
-	zc.pc = conn
+	opts := newPartitionConsumerOpts(zc.topic, zc.consumerName, tn.Partition, zc.options)
+	opts.zeroQueueReconnectedPolicy = func(pc *partitionConsumer) {
+		if zc.waitingOnReceive.Load() {
+			pc.log.Info("zeroQueueConsumer reconnect, reset availablePermits")
+			pc.availablePermits.inc()
+		}
+	}
+	pc, err := newPartitionConsumer(zc, zc.client, opts, zc.messageCh, zc.dlq, zc.metrics, true)
+	if err != nil {
+		return nil, err
+	}
+	zc.pc = pc
 
 	return zc, nil
 }
@@ -115,17 +128,26 @@ func (z *zeroQueueConsumer) Receive(ctx context.Context) (Message, error) {
 	}
 	z.Lock()
 	defer z.Unlock()
+	z.waitingOnReceive.Store(true)
 	z.pc.availablePermits.inc()
 	for {
 		select {
 		case <-z.closeCh:
+			z.waitingOnReceive.Store(false)
 			return nil, newError(ConsumerClosed, "consumer closed")
 		case cm, ok := <-z.messageCh:
 			if !ok {
 				return nil, newError(ConsumerClosed, "consumer closed")
 			}
-			return cm.Message, nil
+			message, ok := cm.Message.(*message)
+			if ok && message.getConn().ID() == z.pc._getConn().ID() {
+				z.waitingOnReceive.Store(false)
+				return cm.Message, nil
+			} else {
+				z.log.WithField("messageID", cm.Message.ID()).Warn("message from old connection discarded after reconnection")
+			}
 		case <-ctx.Done():
+			z.waitingOnReceive.Store(false)
 			return nil, ctx.Err()
 		}
 	}
@@ -142,11 +164,14 @@ func (z *zeroQueueConsumer) Ack(m Message) error {
 
 func (z *zeroQueueConsumer) checkMsgIDPartition(msgID MessageID) error {
 	partition := msgID.PartitionIdx()
-	if partition != 0 {
-		z.log.Errorf("invalid partition index %d expected a partition equal to 0",
-			partition)
-		return fmt.Errorf("invalid partition index %d expected a partition equal to 0",
-			partition)
+	if partition == 0 || partition == -1 {
+		return nil
+	}
+	if partition != z.pc.partitionIdx {
+		z.log.Errorf("invalid partition index %d expected a partition equal to %d",
+			partition, z.pc.partitionIdx)
+		return fmt.Errorf("invalid partition index %d expected a partition equal to %d",
+			partition, z.pc.partitionIdx)
 	}
 	return nil
 }
@@ -236,6 +261,12 @@ func (z *zeroQueueConsumer) NackID(msgID MessageID) {
 }
 
 func (z *zeroQueueConsumer) Close() {
+	z.closeWithCause(nil)
+}
+
+// closeWithCause closes the consumer and notifies any ConsumerCloseInterceptor
+// with the supplied cause. The hook fires exactly once per consumer.
+func (z *zeroQueueConsumer) closeWithCause(err error) {
 	z.closeOnce.Do(func() {
 		z.Lock()
 		defer z.Unlock()
@@ -247,6 +278,7 @@ func (z *zeroQueueConsumer) Close() {
 		z.rlq.close()
 		z.metrics.ConsumersClosed.Inc()
 		z.metrics.ConsumersPartitions.Sub(float64(1))
+		z.options.Interceptors.OnConsumerClose(z, err)
 	})
 }
 

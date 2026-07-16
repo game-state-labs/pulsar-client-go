@@ -25,13 +25,18 @@ import (
 	"testing"
 
 	"github.com/apache/pulsar-client-go/oauth2"
-	"github.com/apache/pulsar-client-go/oauth2/store"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockOAuthServer will mock a oauth service for the tests
 func mockOAuthServer() *httptest.Server {
+	return mockOAuthServerWithToken("token-content")
+}
+
+// mockOAuthServerWithToken will mock a oauth service for the tests with a custom token.
+func mockOAuthServerWithToken(token string) *httptest.Server {
 	// prepare a port for the mocked server
 	server := httptest.NewUnstartedServer(http.DefaultServeMux)
 
@@ -47,7 +52,7 @@ func mockOAuthServer() *httptest.Server {
 		fmt.Fprintln(writer, s)
 	})
 	mockedHandler.HandleFunc("/oauth/token", func(writer http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintln(writer, "{\n  \"access_token\": \"token-content\",\n  \"token_type\": \"Bearer\"\n}")
+		fmt.Fprintf(writer, "{\n  \"access_token\": \"%s\",\n  \"token_type\": \"Bearer\"\n}\n", token)
 	})
 	mockedHandler.HandleFunc("/authorize", func(writer http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(writer, "true")
@@ -99,37 +104,44 @@ func TestOauth2(t *testing.T) {
 		Audience:       server.URL,
 	}
 
-	memoryStore := store.NewMemoryStore()
-	err = saveGrant(memoryStore, kf, issuer.Audience)
+	auth, err := NewAuthenticationOAuth2WithFlow(issuer, oauth2.ClientCredentialsFlowOptions{
+		KeyFile: kf,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	auth, err := NewAuthenticationOAuth2(issuer, memoryStore)
-	if err != nil {
-		t.Fatal(err)
+	provider, ok := auth.(*OAuth2Provider)
+	if !ok {
+		t.Fatal("unexpected provider type")
 	}
-
-	token, err := auth.source.Token()
+	token, err := provider.source.Token()
 	if err != nil {
 		t.Fatal(err)
 	}
 	assert.Equal(t, "token-content", token.AccessToken)
 }
 
-func saveGrant(store store.Store, keyFile, audience string) error {
-	flow, err := oauth2.NewDefaultClientCredentialsFlow(oauth2.ClientCredentialsFlowOptions{
-		KeyFile:          keyFile,
-		AdditionalScopes: nil,
-	})
-	if err != nil {
-		return err
-	}
+func TestOAuth2IssuerOverrideUsesAuthParams(t *testing.T) {
+	serverFromKeyFile := mockOAuthServerWithToken("token-from-keyfile")
+	defer serverFromKeyFile.Close()
+	serverFromParams := mockOAuthServerWithToken("token-from-params")
+	defer serverFromParams.Close()
 
-	grant, err := flow.Authorize(audience)
-	if err != nil {
-		return err
-	}
+	kf, err := mockKeyFile(serverFromKeyFile.URL)
+	defer os.Remove(kf)
+	require.NoError(t, err)
 
-	return store.SaveGrant(audience, *grant)
+	provider, err := NewAuthenticationOAuth2WithParams(
+		serverFromParams.URL,
+		"client-id",
+		serverFromParams.URL,
+		kf,
+		http.DefaultTransport,
+	)
+	require.NoError(t, err)
+
+	token, err := provider.source.Token()
+	require.NoError(t, err)
+	assert.Equal(t, "token-from-params", token.AccessToken)
 }
