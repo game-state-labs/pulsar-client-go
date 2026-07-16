@@ -40,6 +40,7 @@ const (
 	LZ4
 	ZLib
 	ZSTD
+	SNAPPY
 )
 
 type CompressionLevel int
@@ -120,6 +121,7 @@ type ProducerOptions struct {
 	//  - LZ4
 	//  - ZLIB
 	//  - ZSTD
+	//	- SNAPPY
 	//
 	// Note: ZSTD is supported since Pulsar 2.3. Consumers will need to be at least at that
 	// release in order to be able to receive messages compressed with ZSTD.
@@ -196,6 +198,18 @@ type ProducerOptions struct {
 	// EnableChunking controls whether automatic chunking of messages is enabled for the producer. By default, chunking
 	// is disabled.
 	// Chunking can not be enabled when batching is enabled.
+	//
+	// Note: If chunking is enabled and the consumer is configured with DLQ/RLQ (Dead Letter Queue / Retry Letter
+	// Queue), it is recommended to also enable chunking in the DLQ policy's ProducerOptions so that large chunked
+	// messages can be forwarded to the DLQ/RLQ topic successfully. Example:
+	//   DLQ: &pulsar.DLQPolicy{
+	//       MaxDeliveries:   3,
+	//       DeadLetterTopic: "my-dlq-topic",
+	//       ProducerOptions: pulsar.ProducerOptions{
+	//           EnableChunking:  true,
+	//           DisableBatching: true,
+	//       },
+	//   }
 	EnableChunking bool
 
 	// ChunkMaxMessageSize is the max size of single chunk payload.
@@ -229,10 +243,22 @@ type Producer interface {
 	// producer.Send(ctx, pulsar.ProducerMessage{ Payload: myPayload })
 	Send(context.Context, *ProducerMessage) (MessageID, error)
 
-	// SendAsync a message in asynchronous mode
-	// This call is blocked when the `maxPendingMessages` becomes full (default: 1000)
+	// SendAsync a message in asynchronous mode. The send operation completes in the background
+	// and the provided callback is invoked once the broker acknowledges the message (or when
+	// the publish fails), so the caller can continue without waiting for the result.
+	// This call is blocked when the `maxPendingMessages` becomes full (default: 1000) unless
+	// `DisableBlockIfQueueFull` is set to true, in which case it returns an error immediately.
 	// The callback will report back the message being published and
 	// the eventual error in publishing
+	// The context passed in the call is only used for the duration of the SendAsync call itself
+	// (i.e., to control blocking when the queue is full), and not for the entire message lifetime.
+	// Once SendAsync returns, the message lifetime is controlled by the SendTimeout configuration.
+	// Example:
+	// producer.SendAsync(ctx, &pulsar.ProducerMessage{
+	//     Payload: myPayload,
+	// }, func(msgID pulsar.MessageID, message *pulsar.ProducerMessage, err error) {
+	//     // handle publish result
+	// })
 	SendAsync(context.Context, *ProducerMessage, func(MessageID, *ProducerMessage, error))
 
 	// LastSequenceID get the last sequence id that was published by this producer.

@@ -28,29 +28,37 @@ import (
 	"github.com/apache/pulsar-client-go/oauth2"
 	"github.com/apache/pulsar-client-go/oauth2/cache"
 	"github.com/apache/pulsar-client-go/oauth2/clock"
-	"github.com/apache/pulsar-client-go/oauth2/store"
 )
 
 const (
-	ConfigParamType                  = "type"
-	ConfigParamTypeClientCredentials = "client_credentials"
-	ConfigParamIssuerURL             = "issuerUrl"
-	ConfigParamAudience              = "audience"
-	ConfigParamScope                 = "scope"
-	ConfigParamKeyFile               = "privateKey"
-	ConfigParamClientID              = "clientId"
+	ConfigParamType                    = "type"
+	ConfigParamTypeClientCredentials   = "client_credentials"
+	ConfigParamIssuerURL               = "issuerUrl"
+	ConfigParamAudience                = "audience"
+	ConfigParamScope                   = "scope"
+	ConfigParamKeyFile                 = "privateKey"
+	ConfigParamClientID                = "clientId"
+	ConfigParamTokenEndpointAuthMethod = "tokenEndpointAuthMethod"
+	ConfigParamTLSCertFile             = "tlsCertFile"
+	ConfigParamTLSKeyFile              = "tlsKeyFile"
+	ConfigParamTrustCertsFilePath      = "trustCertsFilePath"
 )
 
 type oauth2AuthProvider struct {
 	clock            clock.Clock
 	issuer           oauth2.Issuer
-	store            store.Store
 	source           cache.CachingTokenSource
 	defaultTransport http.RoundTripper
 	tokenTransport   *transport
+	flow             *oauth2.ClientCredentialsFlow
 }
 
-// NewAuthenticationOAuth2WithParams return a interface of Provider with string map.
+// NewAuthenticationOAuth2WithParams creates an OAuth2 auth provider from string params.
+//
+// For client_credentials, tokenEndpointAuthMethod defaults to client_secret_post.
+// Required params:
+//   - client_secret_post: privateKey
+//   - tls_client_auth: issuerUrl, tlsCertFile, tlsKeyFile
 func NewAuthenticationOAuth2WithParams(params map[string]string) (Provider, error) {
 	issuer := oauth2.Issuer{
 		IssuerEndpoint: params[ConfigParamIssuerURL],
@@ -58,57 +66,40 @@ func NewAuthenticationOAuth2WithParams(params map[string]string) (Provider, erro
 		Audience:       params[ConfigParamAudience],
 	}
 
-	// initialize a store of authorization grants
-	st := store.NewMemoryStore()
 	switch params[ConfigParamType] {
 	case ConfigParamTypeClientCredentials:
 		flow, err := oauth2.NewDefaultClientCredentialsFlow(oauth2.ClientCredentialsFlowOptions{
-			KeyFile:          params[ConfigParamKeyFile],
-			AdditionalScopes: strings.Split(params[ConfigParamScope], " "),
+			KeyFile:                 params[ConfigParamKeyFile],
+			ClientID:                params[ConfigParamClientID],
+			IssuerURL:               params[ConfigParamIssuerURL],
+			AdditionalScopes:        strings.Split(params[ConfigParamScope], " "),
+			TokenEndpointAuthMethod: params[ConfigParamTokenEndpointAuthMethod],
+			TLSCertFile:             params[ConfigParamTLSCertFile],
+			TLSKeyFile:              params[ConfigParamTLSKeyFile],
+			TrustCertsFilePath:      params[ConfigParamTrustCertsFilePath],
 		})
 		if err != nil {
 			return nil, err
 		}
-		grant, err := flow.Authorize(issuer.Audience)
-		if err != nil {
-			return nil, err
-		}
-		err = st.SaveGrant(issuer.Audience, *grant)
-		if err != nil {
-			return nil, err
-		}
+		return NewAuthenticationOAuth2(issuer, flow), nil
 	default:
 		return nil, fmt.Errorf("unsupported authentication type: %s", params[ConfigParamType])
 	}
-
-	return NewAuthenticationOAuth2(issuer, st), nil
 }
 
 func NewAuthenticationOAuth2(
 	issuer oauth2.Issuer,
-	store store.Store) Provider {
+	flow *oauth2.ClientCredentialsFlow) Provider {
 
 	return &oauth2AuthProvider{
 		clock:  clock.RealClock{},
 		issuer: issuer,
-		store:  store,
+		flow:   flow,
 	}
 }
 
 func (p *oauth2AuthProvider) Init() error {
-	grant, err := p.store.LoadGrant(p.issuer.Audience)
-	if err != nil {
-		if err == store.ErrNoAuthenticationData {
-			return nil
-		}
-		return err
-	}
-	refresher, err := p.getRefresher(grant.Type)
-	if err != nil {
-		return err
-	}
-
-	source, err := cache.NewDefaultTokenCache(p.store, p.issuer.Audience, refresher)
+	source, err := cache.NewDefaultTokenCache(p.issuer.Audience, p.flow)
 	if err != nil {
 		return err
 	}
@@ -138,17 +129,6 @@ func (p *oauth2AuthProvider) GetData() ([]byte, error) {
 
 func (p *oauth2AuthProvider) Close() error {
 	return nil
-}
-
-func (p *oauth2AuthProvider) getRefresher(t oauth2.AuthorizationGrantType) (oauth2.AuthorizationGrantRefresher, error) {
-	switch t {
-	case oauth2.GrantTypeClientCredentials:
-		return oauth2.NewDefaultClientCredentialsGrantRefresher(p.clock)
-	case oauth2.GrantTypeDeviceCode:
-		return oauth2.NewDefaultDeviceAuthorizationGrantRefresher(p.clock)
-	default:
-		return nil, store.ErrUnsupportedAuthData
-	}
 }
 
 type transport struct {

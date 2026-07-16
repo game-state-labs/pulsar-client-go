@@ -21,14 +21,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal"
+	"github.com/apache/pulsar-client-go/pulsar/log"
 
 	"google.golang.org/protobuf/proto"
 
@@ -175,7 +178,7 @@ func TestMaxPendingChunkMessages(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, c)
 	defer c.Close()
-	pc := c.(*consumer).consumers[0]
+	pc := c.(*consumer).partitionConsumers()[0]
 
 	sendSingleChunk(producer, "0", 0, 2)
 	// MaxPendingChunkedMessage is 1, the chunked message with uuid 0 will be discarded
@@ -225,7 +228,7 @@ func TestExpireIncompleteChunks(t *testing.T) {
 	defer c.Close()
 
 	uuid := "test-uuid"
-	chunkCtxMap := c.(*consumer).consumers[0].chunkedMsgCtxMap
+	chunkCtxMap := c.(*consumer).partitionConsumers()[0].chunkedMsgCtxMap
 	chunkCtxMap.addIfAbsent(uuid, 2, 100)
 	ctx := chunkCtxMap.get(uuid)
 	assert.NotNil(t, ctx)
@@ -544,7 +547,7 @@ func sendSingleChunk(p Producer, uuid string, chunkID int, totalChunks int) {
 		Payload: []byte(fmt.Sprintf("chunk-%s-%d|", uuid, chunkID)),
 	}
 	wholePayload := msg.Payload
-	producerImpl := p.(*producer).producers[0].(*partitionProducer)
+	producerImpl := p.(*producer).getProducer(0).(*partitionProducer)
 	mm := producerImpl.genMetadata(msg, len(wholePayload), time.Now())
 	mm.Uuid = proto.String(uuid)
 	mm.NumChunksFromMsg = proto.Int32(int32(totalChunks))
@@ -577,4 +580,391 @@ func sendSingleChunk(p Producer, uuid string, chunkID int, totalChunks int) {
 		},
 		uint32(internal.MaxMessageSize),
 	)
+}
+
+func TestChunkWithReconnection(t *testing.T) {
+	sLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := NewClient(ClientOptions{
+		URL:    lookupURL,
+		Logger: log.NewLoggerWithSlog(sLogger),
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:               topic,
+		DisableBatching:     true,
+		EnableChunking:      true,
+		ChunkMaxMessageSize: 100,
+		MaxPendingMessages:  200000,
+		SendTimeout:         60 * time.Second,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, producer)
+
+	c, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		Type:             Exclusive,
+		SubscriptionName: "chunk-subscriber",
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, c)
+	defer c.Close()
+
+	// Reduce publish rate to prevent the producer sending messages too fast
+	url := adminURL + "/" + "admin/v2/persistent/public/default/" + topic + "/publishRate"
+	makeHTTPCall(t, http.MethodPost, url, "{\"publishThrottlingRateInMsg\": 1,\"publishThrottlingRateInByte\": 100}")
+	// Need to wait some time to let the rate limiter take effect
+	time.Sleep(2 * time.Second)
+
+	// payload/ChunkMaxMessageSize = 1000/100 = 10 msg, and publishThrottlingRateInMsg = 1
+	// so that this chunk msg will send finish after 10 seconds
+	producer.SendAsync(context.Background(), &ProducerMessage{
+		Payload: createTestMessagePayload(1000),
+	}, func(_ MessageID, _ *ProducerMessage, err error) {
+		assert.Nil(t, err)
+	})
+	assert.NoError(t, err)
+
+	time.Sleep(5 * time.Second)
+	//	trigger topic unload to test sending chunk msg with reconnection
+	url = adminURL + "/" + "admin/v2/persistent/public/default/" + topic + "/unload"
+	makeHTTPCall(t, http.MethodPut, url, "")
+	// Need to wait some time to receive all chunk messages
+	time.Sleep(10 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	msg, err := c.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.NotNil(t, msg.ID())
+}
+
+func TestResendChunkMessages(t *testing.T) {
+	sLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := NewClient(ClientOptions{
+		URL:    lookupURL,
+		Logger: log.NewLoggerWithSlog(sLogger),
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:               topic,
+		DisableBatching:     true,
+		EnableChunking:      true,
+		ChunkMaxMessageSize: 100,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, producer)
+
+	c, err := client.Subscribe(ConsumerOptions{
+		Topic:                    topic,
+		Type:                     Exclusive,
+		SubscriptionName:         "chunk-subscriber",
+		MaxPendingChunkedMessage: 10,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, c)
+	defer c.Close()
+
+	sendSingleChunk(producer, "0", 0, 2)
+	sendSingleChunk(producer, "0", 0, 2) // Resending the first chunk
+	sendSingleChunk(producer, "1", 0, 3) // This is for testing the interwoven chunked message
+	sendSingleChunk(producer, "1", 1, 3)
+	sendSingleChunk(producer, "1", 0, 3) // Resending the UUID-1 chunked message
+	sendSingleChunk(producer, "0", 1, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	msg, err := c.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, "chunk-0-0|chunk-0-1|", string(msg.Payload()))
+	c.Ack(msg)
+
+	sendSingleChunk(producer, "1", 1, 3)
+	sendSingleChunk(producer, "1", 2, 3)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	msg, err = c.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, "chunk-1-0|chunk-1-1|chunk-1-2|", string(msg.Payload()))
+	c.Ack(msg)
+}
+
+func TestResendChunkWithAckHoleMessages(t *testing.T) {
+	sLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := NewClient(ClientOptions{
+		URL:    lookupURL,
+		Logger: log.NewLoggerWithSlog(sLogger),
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:               topic,
+		DisableBatching:     true,
+		EnableChunking:      true,
+		ChunkMaxMessageSize: 100,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, producer)
+
+	c, err := client.Subscribe(ConsumerOptions{
+		Topic:                    topic,
+		Type:                     Exclusive,
+		SubscriptionName:         "chunk-subscriber",
+		MaxPendingChunkedMessage: 10,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, c)
+	defer c.Close()
+
+	sendSingleChunk(producer, "0", 0, 4)
+	sendSingleChunk(producer, "0", 1, 4)
+	sendSingleChunk(producer, "0", 2, 4)
+	sendSingleChunk(producer, "0", 1, 4) // Resending previous chunk
+	sendSingleChunk(producer, "0", 2, 4)
+	sendSingleChunk(producer, "0", 3, 4)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	msg, err := c.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, "chunk-0-0|chunk-0-1|chunk-0-2|chunk-0-3|", string(msg.Payload()))
+	c.Ack(msg)
+
+	sendSingleChunk(producer, "1", 0, 4)
+	sendSingleChunk(producer, "1", 1, 4)
+	sendSingleChunk(producer, "1", 4, 4) // send broken chunk
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	msg, err = c.Receive(ctx)
+	cancel()
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// TestChunkReconsumeLater tests that chunked messages can be sent to the retry topic via ReconsumeLater,
+// and are routed to the DLQ topic after exceeding the maximum number of retries.
+// Payload exceeds broker maxMessageSize, so RLQ/DLQ producers must enable chunking.
+func TestChunkReconsumeLater(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	subName := fmt.Sprintf("chunk-rlq-sub-%d", time.Now().Unix())
+	maxRedeliveries := 2
+
+	// Create producer with chunking enabled
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: true,
+		EnableChunking:  true,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, producer)
+	defer producer.Close()
+
+	// Create consumer with retry and DLQ enabled
+	// DLQPolicy.ProducerOptions enables chunking to ensure RLQ/DLQ producers can send large messages
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:                       topic,
+		SubscriptionName:            subName,
+		Type:                        Shared,
+		SubscriptionInitialPosition: SubscriptionPositionEarliest,
+		DLQ: &DLQPolicy{
+			MaxDeliveries: uint32(maxRedeliveries),
+			ProducerOptions: ProducerOptions{
+				DisableBatching: true,
+				EnableChunking:  true,
+			},
+		},
+		RetryEnable:         true,
+		NackRedeliveryDelay: 1 * time.Second,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, consumer)
+	defer consumer.Close()
+
+	// Send a chunked message larger than broker maxMessageSize (5MB, far exceeding the 1MB broker limit)
+	// If RLQ/DLQ producer does not enable chunking, sending will fail
+	content := createTestMessagePayload(5 * _brokerMaxMessageSize)
+	msgID, err := producer.Send(context.Background(), &ProducerMessage{
+		Payload: content,
+		Key:     "chunk-key",
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, msgID)
+
+	// First receive and ReconsumeLater
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	msg, err := consumer.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, content, msg.Payload())
+	assert.Equal(t, "chunk-key", msg.Key())
+	consumer.ReconsumeLater(msg, 1*time.Second)
+
+	// Second receive (from retry topic), ReconsumeLater again
+	// If RLQ producer does not enable chunking, the message won't be received here (send failure)
+	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+	msg, err = consumer.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, content, msg.Payload())
+	consumer.ReconsumeLater(msg, 1*time.Second)
+
+	// Third receive (from retry topic), ReconsumeLater again, now exceeds maxRedeliveries, should route to DLQ
+	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+	msg, err = consumer.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, content, msg.Payload())
+	consumer.ReconsumeLater(msg, 1*time.Second)
+
+	// Confirm no more messages on the original consumer
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	msg, err = consumer.Receive(ctx)
+	cancel()
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, msg)
+
+	// Consume from DLQ topic, verify the large chunked message is correctly routed to DLQ
+	// If DLQ producer does not enable chunking, the message won't be received here
+	dlqTopic := "persistent://public/default/" + topic + "-" + subName + "-DLQ"
+	dlqConsumer, err := client.Subscribe(ConsumerOptions{
+		Topic:                       dlqTopic,
+		SubscriptionName:            "dlq-sub",
+		SubscriptionInitialPosition: SubscriptionPositionEarliest,
+	})
+	assert.NoError(t, err)
+	defer dlqConsumer.Close()
+
+	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+	dlqMsg, err := dlqConsumer.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.Equal(t, content, dlqMsg.Payload())
+	assert.Equal(t, "chunk-key", dlqMsg.Key())
+
+	// Verify DLQ message properties
+	assert.NotEmpty(t, dlqMsg.Properties()[SysPropertyRealTopic])
+	assert.NotEmpty(t, dlqMsg.Properties()[SysPropertyOriginMessageID])
+
+	assert.NoError(t, dlqConsumer.Ack(dlqMsg))
+
+	// No more messages on the DLQ topic
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	dlqMsg, err = dlqConsumer.Receive(ctx)
+	cancel()
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, dlqMsg)
+}
+
+// TestChunkDLQWithNack tests that chunked messages trigger redelivery via Nack,
+// and are routed to the DLQ topic after exceeding the maximum redelivery count.
+// Uses a payload larger than broker maxMessageSize to ensure DLQ producer must enable chunking to send successfully.
+func TestChunkDLQWithNack(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	dlqTopic := newTopicName()
+	subName := "chunk-dlq-sub"
+	maxRedeliveries := uint32(2)
+
+	// Create DLQ consumer
+	dlqConsumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            dlqTopic,
+		SubscriptionName: "dlq-verify",
+	})
+	assert.NoError(t, err)
+	defer dlqConsumer.Close()
+
+	// Create producer with chunking enabled
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: true,
+		EnableChunking:  true,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, producer)
+	defer producer.Close()
+
+	// Create consumer with DLQ configured
+	// DLQPolicy.ProducerOptions enables chunking to ensure DLQ producer can send large messages
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            topic,
+		SubscriptionName: subName,
+		Type:             Shared,
+		DLQ: &DLQPolicy{
+			MaxDeliveries:   maxRedeliveries,
+			DeadLetterTopic: dlqTopic,
+			ProducerOptions: ProducerOptions{
+				DisableBatching: true,
+				EnableChunking:  true,
+			},
+		},
+		NackRedeliveryDelay: 1 * time.Second,
+	})
+	assert.NoError(t, err)
+	defer consumer.Close()
+
+	// Send a chunked message larger than broker maxMessageSize (5MB, far exceeding the 1MB broker limit)
+	// If DLQ producer does not enable chunking, sending will fail
+	content := createTestMessagePayload(5 * _brokerMaxMessageSize)
+	_, err = producer.Send(context.Background(), &ProducerMessage{
+		Payload: content,
+		Key:     "chunk-dlq-key",
+		Properties: map[string]string{
+			"custom-prop": "custom-value",
+		},
+	})
+	assert.NoError(t, err)
+
+	// Receive and Nack the message maxRedeliveries times
+	for i := 0; i < int(maxRedeliveries); i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		msg, err := consumer.Receive(ctx)
+		cancel()
+		assert.NoError(t, err)
+		assert.Equal(t, content, msg.Payload())
+		assert.Equal(t, "chunk-dlq-key", msg.Key())
+		consumer.Nack(msg)
+	}
+
+	// Message should be routed to DLQ
+	// If DLQ producer does not enable chunking, the large message cannot be sent and this will timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	dlqMsg, err := dlqConsumer.Receive(ctx)
+	cancel()
+	assert.NoError(t, err)
+	assert.NotNil(t, dlqMsg)
+	assert.Equal(t, content, dlqMsg.Payload())
+	assert.Equal(t, "chunk-dlq-key", dlqMsg.Key())
+
+	// Verify original properties are preserved
+	assert.Equal(t, "custom-value", dlqMsg.Properties()["custom-prop"])
+
+	// Verify DLQ metadata properties
+	assert.NotEmpty(t, dlqMsg.Properties()[SysPropertyRealTopic])
+	assert.Contains(t, dlqMsg.Properties()[SysPropertyRealTopic], topic)
+	assert.NotEmpty(t, dlqMsg.Properties()[SysPropertyOriginMessageID])
+
+	assert.NoError(t, dlqConsumer.Ack(dlqMsg))
+
+	// No more messages on the original consumer
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	msg, err := consumer.Receive(ctx)
+	cancel()
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, msg)
 }

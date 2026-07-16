@@ -74,7 +74,7 @@ type RPCClient interface {
 
 	RequestOnCnx(cnx Connection, requestID uint64, cmdType pb.BaseCommand_Type, message proto.Message) (*RPCResult, error)
 
-	LookupService(URL string) LookupService
+	LookupService(URL string) (LookupService, error)
 }
 
 type rpcClient struct {
@@ -94,9 +94,10 @@ type rpcClient struct {
 	lookupProperties        []*pb.KeyValue
 }
 
-func NewRPCClient(serviceURL *url.URL, pool ConnectionPool,
+func NewRPCClient(serviceURL string, pool ConnectionPool,
 	requestTimeout time.Duration, logger log.Logger, metrics *Metrics,
-	listenerName string, tlsConfig *TLSOptions, authProvider auth.Provider, lookupProperties []*pb.KeyValue) RPCClient {
+	listenerName string, tlsConfig *TLSOptions, authProvider auth.Provider,
+	lookupProperties []*pb.KeyValue) (RPCClient, error) {
 	c := rpcClient{
 		pool:                pool,
 		requestTimeout:      requestTimeout,
@@ -108,13 +109,13 @@ func NewRPCClient(serviceURL *url.URL, pool ConnectionPool,
 		urlLookupServiceMap: make(map[string]LookupService),
 		lookupProperties:    lookupProperties,
 	}
-	lookupService, err := c.NewLookupService(serviceURL)
+	lookupService, err := c.LookupService(serviceURL)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to create lookup service: %w", err)
 	}
 	c.lookupService = lookupService
 
-	return &c
+	return &c, nil
 }
 
 func (c *rpcClient) requestToHost(serviceNameResolver *ServiceNameResolver,
@@ -220,51 +221,44 @@ func (c *rpcClient) NewConsumerID() uint64 {
 	return atomic.AddUint64(&c.consumerIDGenerator, 1)
 }
 
-func (c *rpcClient) LookupService(URL string) LookupService {
+func (c *rpcClient) LookupService(URL string) (LookupService, error) {
 	if URL == "" {
-		return c.lookupService
+		return c.lookupService, nil
 	}
 	c.urlLookupServiceMapLock.Lock()
 	defer c.urlLookupServiceMapLock.Unlock()
 	lookupService, ok := c.urlLookupServiceMap[URL]
 	if ok {
-		return lookupService
+		return lookupService, nil
 	}
 
-	serviceURL, err := url.Parse(URL)
+	lookupService, err := c.newLookupService(URL)
 	if err != nil {
-		panic(err)
-	}
-
-	lookupService, err = c.NewLookupService(serviceURL)
-	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to create lookup service for URL '%s': %w", URL, err)
 	}
 	c.urlLookupServiceMap[URL] = lookupService
-	return lookupService
-
+	return lookupService, nil
 }
 
-func (c *rpcClient) NewLookupService(url *url.URL) (LookupService, error) {
+func (c *rpcClient) newLookupService(serviceURL string) (LookupService, error) {
+	serviceNameResolver, err := NewPulsarServiceNameResolver(serviceURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create service name resolver for URL '%s': %w", serviceURL, err)
+	}
 
-	switch url.Scheme {
-	case "pulsar", "pulsar+ssl":
-		serviceNameResolver := NewPulsarServiceNameResolver(url)
-		return NewLookupService(c, url, serviceNameResolver,
-			c.tlsConfig != nil, c.listenerName, c.lookupProperties, c.log, c.metrics), nil
-	case "http", "https":
-		serviceNameResolver := NewPulsarServiceNameResolver(url)
-		httpClient, err := NewHTTPClient(url, serviceNameResolver, c.tlsConfig,
+	if serviceNameResolver.GetServiceURI().IsHTTP() {
+		httpClient, err := NewHTTPClient(serviceNameResolver, c.tlsConfig,
 			c.requestTimeout, c.log, c.metrics, c.authProvider)
 		if err != nil {
 			return nil, err
 		}
 
 		return NewHTTPLookupService(
-			httpClient, url, serviceNameResolver, c.tlsConfig != nil, c.log, c.metrics), nil
-	default:
-		panic(fmt.Sprintf("Invalid URL scheme '%s'", url.Scheme))
+			httpClient, serviceNameResolver, c.tlsConfig != nil, c.log, c.metrics), nil
 	}
+
+	return NewLookupService(c, serviceNameResolver,
+		c.tlsConfig != nil, c.listenerName, c.lookupProperties, c.log, c.metrics), nil
 }
 
 func (c *rpcClient) Close() {

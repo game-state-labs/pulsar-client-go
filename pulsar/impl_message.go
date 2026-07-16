@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apache/pulsar-client-go/pulsar/internal"
+
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
@@ -192,6 +194,9 @@ func (id *messageID) BatchSize() int32 {
 }
 
 func (id *messageID) String() string {
+	if id.batchIdx > -1 {
+		return fmt.Sprintf("%d:%d:%d:%d", id.ledgerID, id.entryID, id.partitionIdx, id.batchIdx)
+	}
 	return fmt.Sprintf("%d:%d:%d", id.ledgerID, id.entryID, id.partitionIdx)
 }
 
@@ -313,6 +318,8 @@ type message struct {
 	encryptionContext   *EncryptionContext
 	index               *uint64
 	brokerPublishTime   *time.Time
+	conn                internal.Connection
+	isNullValue         bool
 }
 
 func (msg *message) Topic() string {
@@ -325,6 +332,10 @@ func (msg *message) Properties() map[string]string {
 
 func (msg *message) Payload() []byte {
 	return msg.payLoad
+}
+
+func (msg *message) IsNullValue() bool {
+	return msg.isNullValue
 }
 
 func (msg *message) ID() MessageID {
@@ -392,6 +403,10 @@ func (msg *message) BrokerPublishTime() *time.Time {
 
 func (msg *message) size() int {
 	return len(msg.payLoad)
+}
+
+func (msg *message) getConn() internal.Connection {
+	return msg.conn
 }
 
 func newAckTracker(size uint) *ackTracker {
