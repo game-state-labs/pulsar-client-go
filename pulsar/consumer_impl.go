@@ -509,11 +509,8 @@ func (c *consumer) UnsubscribeForce() error {
 }
 
 func (c *consumer) EnterDrainMode() error {
-	c.Lock()
-	defer c.Unlock()
-
 	var errMsg string
-	for _, consumer := range c.consumers {
+	for _, consumer := range c.partitionConsumers() {
 		if err := consumer.enterInternalDrainMode(); err != nil {
 			errMsg += fmt.Sprintf("topic %s, subscription %s: %s; ", consumer.topic, c.Subscription(), err)
 		}
@@ -525,11 +522,9 @@ func (c *consumer) EnterDrainMode() error {
 }
 
 func (c *consumer) ExitDrainMode() error {
-	c.Lock()
-	defer c.Unlock()
 
 	var errMsg string
-	for _, consumer := range c.consumers {
+	for _, consumer := range c.partitionConsumers() {
 		if err := consumer.exitInternalDrainMode(); err != nil {
 			errMsg += fmt.Sprintf("topic %s, subscription %s: %s; ", consumer.topic, c.Subscription(), err)
 		}
