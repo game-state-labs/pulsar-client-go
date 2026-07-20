@@ -508,33 +508,6 @@ func (c *consumer) UnsubscribeForce() error {
 	return c.unsubscribe(true)
 }
 
-func (c *consumer) EnterDrainMode() error {
-	var errMsg string
-	for _, consumer := range c.partitionConsumers() {
-		if err := consumer.enterInternalDrainMode(); err != nil {
-			errMsg += fmt.Sprintf("topic %s, subscription %s: %s; ", consumer.topic, c.Subscription(), err)
-		}
-	}
-	if errMsg != "" {
-		return errors.New(errMsg)
-	}
-	return nil
-}
-
-func (c *consumer) ExitDrainMode() error {
-
-	var errMsg string
-	for _, consumer := range c.partitionConsumers() {
-		if err := consumer.exitInternalDrainMode(); err != nil {
-			errMsg += fmt.Sprintf("topic %s, subscription %s: %s; ", consumer.topic, c.Subscription(), err)
-		}
-	}
-	if errMsg != "" {
-		return errors.New(errMsg)
-	}
-	return nil
-}
-
 func (c *consumer) unsubscribe(force bool) error {
 	consumers := c.partitionConsumers()
 	var errMsg string

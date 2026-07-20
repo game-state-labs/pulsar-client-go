@@ -54,14 +54,18 @@ func TestConsumerDrainMode(t *testing.T) {
 	totalBufferCapacity := queueSize + messageChanSize
 
 	consumer, err := client.Subscribe(ConsumerOptions{
-		Topic:             topicName,
+		//Topic:             topicName,
 		SubscriptionName:  "drain-mode-sub",
 		Type:              Shared,
-		ReceiverQueueSize: queueSize, // queueCh size is set to ReceiverQueueSize
+		ReceiverQueueSize: queueSize,
+		TopicsPattern:     "ab*", // queueCh size is set to ReceiverQueueSize
 		// Note: messageCh capacity is hardcoded to 10 in the client implementation
 	})
 	assert.Nil(t, err)
 	defer consumer.Close()
+
+	drainConsumer, ok := consumer.(ConsumerWithDrainMode)
+	assert.True(t, ok)
 
 	// Phase 1: Produce initial messages
 	initialMessages := 40
@@ -77,7 +81,7 @@ func TestConsumerDrainMode(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Phase 2: Enter drain mode before consuming any messages
-	err = consumer.EnterDrainMode()
+	err = drainConsumer.EnterDrainMode()
 	assert.Nil(t, err)
 
 	// Consume messages from the buffers while in drain mode
@@ -134,7 +138,7 @@ func TestConsumerDrainMode(t *testing.T) {
 
 	// Phase 4: Exit drain mode and verify new messages start flowing
 	// t.Log("Phase 4: Exiting drain mode and verifying message flow resumes")
-	err = consumer.ExitDrainMode()
+	err = drainConsumer.ExitDrainMode()
 	assert.Nil(t, err)
 
 	// Now we should receive some of the previously produced messages
@@ -203,6 +207,9 @@ func TestConsumerBufferDrainMode(t *testing.T) {
 	assert.Nil(t, err)
 	defer consumer.Close()
 
+	drainConsumer, ok := consumer.(ConsumerWithDrainMode)
+	assert.True(t, ok)
+
 	messageCount := 40
 	for i := range messageCount {
 		_, err := producer.Send(ctx, &ProducerMessage{
@@ -215,7 +222,7 @@ func TestConsumerBufferDrainMode(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Enter drain mode before receiving any messages
-	err = consumer.EnterDrainMode()
+	err = drainConsumer.EnterDrainMode()
 	assert.Nil(t, err)
 
 	// Now consume messages from the client buffer while in drain mode
@@ -271,7 +278,7 @@ func TestConsumerBufferDrainMode(t *testing.T) {
 
 	// Now exit drain mode and verify we get more messages
 	// t.Log("Exiting drain mode to verify normal message flow resumes")
-	err = consumer.ExitDrainMode()
+	err = drainConsumer.ExitDrainMode()
 	assert.Nil(t, err)
 
 	// Give some time for permits to be received and messages to be delivered

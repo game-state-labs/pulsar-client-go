@@ -49,6 +49,11 @@ func main() {
 	}
 	defer consumer.Close()
 
+	drainConsumer, ok := consumer.(pulsar.ConsumerWithDrainMode)
+	if !ok {
+		log.Fatal("consumer does not support drain mode")
+	}
+
 	producer, err := client.CreateProducer(pulsar.ProducerOptions{
 		Topic:           topicName,
 		DisableBatching: true, // For more predictable message delivery in this example
@@ -88,7 +93,7 @@ func main() {
 				fmt.Printf("Entering drain mode - Messages that should be in client buffer when entering drain mode: %d\n", len(messagesInBuffer))
 				messagesMutex.Unlock()
 
-				if err := consumer.EnterDrainMode(); err != nil {
+				if err := drainConsumer.EnterDrainMode(); err != nil {
 					log.Printf("Error entering drain mode: %v", err)
 				}
 
@@ -119,7 +124,7 @@ func main() {
 						messagesMutex.Unlock()
 
 						fmt.Printf("Exiting drain mode - Messages still pending at broker (not delivered due to drain mode): %d\n", pendingMessages)
-						if err := consumer.ExitDrainMode(); err != nil {
+						if err := drainConsumer.ExitDrainMode(); err != nil {
 							log.Printf("Error exiting drain mode: %v", err)
 						}
 
