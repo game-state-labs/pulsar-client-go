@@ -20,8 +20,6 @@ package pulsar
 import (
 	"errors"
 	"fmt"
-
-	pkgerrors "github.com/pkg/errors"
 )
 
 // ConsumerWithDrainMode is a Consumer that additionally supports drain mode.
@@ -39,65 +37,57 @@ type ConsumerWithDrainMode interface {
 }
 
 func (c *consumer) EnterDrainMode() error {
-	var errMsg string
+	var errs []error
 	for _, consumer := range c.partitionConsumers() {
 		if err := consumer.enterInternalDrainMode(); err != nil {
-			errMsg += fmt.Sprintf("topic %s, subscription %s: %s; ", consumer.topic, c.Subscription(), err)
+			errs = append(errs, fmt.Errorf("topic %s, subscription %s: %w", consumer.topic, c.Subscription(), err))
 		}
 	}
-	if errMsg != "" {
-		return errors.New(errMsg)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (c *consumer) ExitDrainMode() error {
-	var errMsg string
+	var errs []error
 	for _, consumer := range c.partitionConsumers() {
 		if err := consumer.exitInternalDrainMode(); err != nil {
-			errMsg += fmt.Sprintf("topic %s, subscription %s: %s; ", consumer.topic, c.Subscription(), err)
+			errs = append(errs, fmt.Errorf("topic %s, subscription %s: %w", consumer.topic, c.Subscription(), err))
 		}
 	}
-	if errMsg != "" {
-		return errors.New(errMsg)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (c *multiTopicConsumer) EnterDrainMode() error {
-	var errs error
+	var errs []error
 	for t, consumer := range c.consumers {
 		drainable, ok := consumer.(ConsumerWithDrainMode)
 		if !ok {
-			errs = pkgerrors.Errorf("consumer for topic=%s subscription=%s does not support drain mode",
-				t, c.Subscription())
+			errs = append(errs, fmt.Errorf("consumer for topic=%s subscription=%s does not support drain mode",
+				t, c.Subscription()))
 			continue
 		}
 		if err := drainable.EnterDrainMode(); err != nil {
-			msg := fmt.Sprintf("unable to enter drain mode for topic=%s subscription=%s",
-				t, c.Subscription())
-			errs = pkgerrors.Wrap(err, msg)
+			errs = append(errs, fmt.Errorf("unable to enter drain mode for topic=%s subscription=%s: %w",
+				t, c.Subscription(), err))
 		}
 	}
-	return errs
+	return errors.Join(errs...)
 }
 
 func (c *multiTopicConsumer) ExitDrainMode() error {
-	var errs error
+	var errs []error
 	for t, consumer := range c.consumers {
 		drainable, ok := consumer.(ConsumerWithDrainMode)
 		if !ok {
-			errs = pkgerrors.Errorf("consumer for topic=%s subscription=%s does not support drain mode",
-				t, c.Subscription())
+			errs = append(errs, fmt.Errorf("consumer for topic=%s subscription=%s does not support drain mode",
+				t, c.Subscription()))
 			continue
 		}
 		if err := drainable.ExitDrainMode(); err != nil {
-			msg := fmt.Sprintf("unable to exit drain mode for topic=%s subscription=%s",
-				t, c.Subscription())
-			errs = pkgerrors.Wrap(err, msg)
+			errs = append(errs, fmt.Errorf("unable to exit drain mode for topic=%s subscription=%s: %w",
+				t, c.Subscription(), err))
 		}
 	}
-	return errs
+	return errors.Join(errs...)
 }
 
 func (z *zeroQueueConsumer) EnterDrainMode() error {
